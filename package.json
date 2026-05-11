@@ -5,6 +5,7 @@
   "scripts": {
     "dev:web": "npm --workspace @landsearch/web run dev",
     "build:web": "npm --workspace @landsearch/web run build",
-    "dev:worker": "npm --workspace @landsearch/worker run dev"
+    "dev:worker": "npm --workspace @landsearch/worker run dev",
+    "start": "npm --workspace @landsearch/worker run build && npm --workspace @landsearch/worker run start"
   }
 }
