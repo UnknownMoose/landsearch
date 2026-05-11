@@ -1,8 +1,8 @@
-import { supabaseAdmin } from "@/lib/supabase";
+import { getSupabaseAdmin } from "@/lib/supabase";
 import { NextResponse } from "next/server";
 
 export async function GET() {
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await getSupabaseAdmin()
     .from("gis_processing_jobs")
     .select("id,status,logs,created_at")
     .order("created_at", { ascending: false })
