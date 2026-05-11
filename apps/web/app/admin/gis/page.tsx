@@ -1,6 +1,9 @@
 "use client";
 
 import { useState } from "react";
+import { supabaseBrowser } from "@/lib/supabase";
+
+const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 
 export default function AdminGisPage() {
   const [file, setFile] = useState<File | null>(null);
@@ -9,11 +12,34 @@ export default function AdminGisPage() {
 
   async function upload() {
     if (!file) return;
+
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setStatus("error");
+      setError("File is too large for the current upload flow. Please use a file smaller than 500MB (or upload as split chunks).")
+      return;
+    }
+
     setStatus("uploading");
     setError(null);
-    const form = new FormData();
-    form.append("file", file);
-    const res = await fetch("/api/uploads", { method: "POST", body: form });
+    const objectPath = `gml/${Date.now()}-${file.name}`;
+    const lowerName = file.name.toLowerCase();
+    const contentType = lowerName.endsWith(".zip") ? "application/zip" : "application/gml+xml";
+
+    const { error: storageError } = await supabaseBrowser.storage
+      .from("gis-uploads")
+      .upload(objectPath, file, { upsert: false, contentType });
+
+    if (storageError) {
+      setStatus("error");
+      setError(`Storage upload failed: ${storageError.message}`);
+      return;
+    }
+
+    const res = await fetch("/api/uploads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ storagePath: objectPath, originalFilename: file.name })
+    });
     if (res.ok) {
       setStatus("queued");
       return;
@@ -37,6 +63,7 @@ export default function AdminGisPage() {
       <div className="rounded border border-zinc-700 p-6">
         <input type="file" accept=".gml,.zip" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
         <button onClick={upload} className="ml-3 rounded bg-emerald-600 px-3 py-2">Upload & Queue</button>
+        <p className="mt-2 text-xs text-zinc-400">Max upload size: 500MB.</p>
         <p className="mt-2 text-sm text-zinc-300">Status: {status}</p>
         {error ? <p className="mt-1 text-sm text-red-400">Error: {error}</p> : null}
       </div>
