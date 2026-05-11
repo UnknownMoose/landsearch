@@ -47,13 +47,24 @@ export default function AdminGisPage() {
 
     setStatus("uploading");
     setError(null);
-    const objectPath = `gml/${Date.now()}-${file.name}`;
-    const lowerName = file.name.toLowerCase();
-    const contentType = lowerName.endsWith(".zip") ? "application/zip" : "application/gml+xml";
+    const signedRes = await fetch("/api/uploads/signed-url", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name })
+    });
+
+    if (!signedRes.ok) {
+      setStatus("error");
+      const payload = await signedRes.json().catch(() => ({}));
+      setError(payload?.error ?? "Could not create signed upload URL");
+      return;
+    }
+
+    const { token, storagePath } = await signedRes.json();
 
     const { error: storageError } = await supabaseBrowser.storage
       .from("gis-uploads")
-      .upload(objectPath, file, { upsert: false, contentType });
+      .uploadToSignedUrl(storagePath, token, file);
 
     if (storageError) {
       setStatus("error");
@@ -64,7 +75,7 @@ export default function AdminGisPage() {
     const res = await fetch("/api/uploads", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ storagePath: objectPath, originalFilename: file.name })
+      body: JSON.stringify({ storagePath, originalFilename: file.name })
     });
     if (res.ok) {
       setStatus("queued");
