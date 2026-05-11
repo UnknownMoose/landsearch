@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, writeFile } from "node:fs/promises";
 import { extname } from "node:path";
+import http from "node:http";
 
 const exec = promisify(execFile);
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -40,4 +41,21 @@ async function run() {
   }
 }
 
+// Start HTTP health server for Railway
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200);
+    res.end("ok");
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+
+const port = process.env.PORT || 3000;
+server.listen(port, () => {
+  console.log(`Health check listening on port ${port}`);
+});
+
+// Start the polling loop
 run();
