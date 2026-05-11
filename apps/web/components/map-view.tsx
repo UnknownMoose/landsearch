@@ -4,6 +4,12 @@ import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useEffect, useRef } from "react";
 
+function getTileBaseUrl() {
+  const configured = process.env.NEXT_PUBLIC_TILESERVER_URL?.trim();
+  if (!configured) return "";
+  return configured.replace(/\/$/, "");
+}
+
 export function MapView() {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -17,9 +23,10 @@ export function MapView() {
     });
 
     map.on("load", () => {
+      const tileBaseUrl = getTileBaseUrl();
       map.addSource("parcels", {
         type: "vector",
-        tiles: [`${process.env.NEXT_PUBLIC_TILESERVER_URL}/api/tiles/parcels/{z}/{x}/{y}`],
+        tiles: [`${tileBaseUrl}/api/tiles/parcels/{z}/{x}/{y}`],
         minzoom: 5,
         maxzoom: 16
       });
