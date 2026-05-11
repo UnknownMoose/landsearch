@@ -118,3 +118,24 @@ server.listen(port, () => {
 
 // Start the polling loop
 run();
+
+
+let isShuttingDown = false;
+
+async function shutdown(signal: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`Received ${signal}, shutting down worker...`);
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+  });
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
+
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
+});
