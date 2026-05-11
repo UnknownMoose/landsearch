@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, writeFile } from "node:fs/promises";
+import { extname } from "node:path";
 
 const exec = promisify(execFile);
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -16,11 +17,17 @@ async function run() {
       continue;
     }
 
-    await supabase.from("gis_processing_jobs").update({ status: "processing" }).eq("id", job.id);
+    await supabase.from("gis_processing_jobs").update({
+      status: "processing",
+      logs: "Downloading upload from storage"
+    }).eq("id", job.id);
     try {
       await mkdir("/tmp/gml", { recursive: true });
-      const localPath = `/tmp/gml/${job.id}.gml`;
+      const sourceExt = extname(job.original_filename ?? "").toLowerCase();
+      const localExt = sourceExt === ".zip" ? ".zip" : ".gml";
+      const localPath = `/tmp/gml/${job.id}${localExt}`;
       const { data } = await supabase.storage.from("gis-uploads").download(job.storage_path);
+      if (!data) throw new Error("Failed to download source file from storage");
       await writeFile(localPath, Buffer.from(await data.arrayBuffer()));
 
       await exec("ogr2ogr", ["-f", "PostgreSQL", dbUrl, localPath, "-nln", "staging_parcels", "-nlt", "PROMOTE_TO_MULTI", "-lco", "GEOMETRY_NAME=geom", "-t_srs", "EPSG:4326", "-overwrite"]);

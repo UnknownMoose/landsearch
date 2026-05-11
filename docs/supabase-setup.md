@@ -34,6 +34,18 @@ Recommended:
 - `POSTGRES_OGR_DSN` (e.g. `PG:host=... dbname=... user=... password=... sslmode=require`)
 - `POSTGRES_DSN` (psql DSN for finalize SQL)
 
+## 4b) Railway deploy checklist (exact)
+1. In Railway, create **New Project** → **Deploy from GitHub repo**.
+2. Set **Root Directory** to `apps/worker`.
+3. Railway will use `apps/worker/Dockerfile` (includes GDAL + psql + worker build/start).
+4. Add these service variables in Railway:
+   - `SUPABASE_URL` = your Supabase project URL (e.g. `https://<project>.supabase.co`)
+   - `SUPABASE_SERVICE_ROLE_KEY` = Supabase service role key
+   - `POSTGRES_OGR_DSN` = `PG:host=<host> dbname=postgres user=postgres password=<password> sslmode=require`
+   - `POSTGRES_DSN` = `postgresql://postgres:<password>@<host>:5432/postgres?sslmode=require`
+5. Deploy the service, then open logs and confirm the container stays running.
+6. Upload a test file from `/admin/gis`; verify `gis_processing_jobs` changes from `queued` to `processing` and then `completed`/`failed`.
+
 ### Optional pg_tileserv (not required if using Vercel tile endpoint)
 - `DATABASE_URL`
 
