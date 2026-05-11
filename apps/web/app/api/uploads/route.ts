@@ -1,4 +1,4 @@
-import { supabaseAdmin } from "@/lib/supabase";
+import { getSupabaseAdmin } from "@/lib/supabase";
 import { NextResponse } from "next/server";
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
@@ -14,7 +14,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing storagePath or originalFilename" }, { status: 400 });
     }
 
-    const { data, error } = await supabaseAdmin.from("gis_processing_jobs").insert({
+    const { data, error } = await getSupabaseAdmin().from("gis_processing_jobs").insert({
       storage_path: storagePath,
       original_filename: originalFilename,
       status: "queued"
@@ -49,13 +49,13 @@ export async function POST(req: Request) {
   const blob = new Blob([bytes], { type: contentType });
 
   const objectPath = `gml/${Date.now()}-${file.name}`;
-  const { error: uploadError } = await supabaseAdmin.storage
+  const { error: uploadError } = await getSupabaseAdmin().storage
     .from("gis-uploads")
     .upload(objectPath, blob, { upsert: false, contentType });
 
   if (uploadError) return NextResponse.json({ error: uploadError.message }, { status: 500 });
 
-  const { data, error } = await supabaseAdmin.from("gis_processing_jobs").insert({
+  const { data, error } = await getSupabaseAdmin().from("gis_processing_jobs").insert({
     storage_path: objectPath,
     original_filename: file.name,
     status: "queued"

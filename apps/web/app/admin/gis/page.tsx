@@ -41,7 +41,7 @@ export default function AdminGisPage() {
     const supabaseBrowser = getSupabaseBrowser();
     if (!supabaseBrowser) {
       setStatus("error");
-      setError("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY configuration.");
+      setError("Missing NEXT_PUBLIC_SUPABASE_URL and a public key (NEXT_PUBLIC_SUPABASE_ANON_KEY or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY).");
       return;
     }
 
