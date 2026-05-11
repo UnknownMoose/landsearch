@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { extname } from "node:path";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import http from "node:http";
 
@@ -75,13 +76,23 @@ async function processJob(job: any) {
   const localPath = `/tmp/gml/${job.id}${localExt}`;
 
   try {
-    const { data, error: downloadError } = await supabase.storage.from("gis-uploads").download(job.storage_path);
-    if (downloadError) throw new Error(`Storage download failed: ${downloadError.message}`);
-    if (!data) throw new Error("Failed to download source file from storage");
+    const { data: signedData, error: signedUrlError } = await supabase.storage
+      .from("gis-uploads")
+      .createSignedUrl(job.storage_path, 60 * 15);
+    if (signedUrlError) throw new Error(`Failed to create signed URL: ${signedUrlError.message}`);
+    if (!signedData?.signedUrl) throw new Error("Failed to create signed URL for source file");
+
+    const downloadResponse = await fetch(signedData.signedUrl);
+    if (!downloadResponse.ok) {
+      throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
+    }
+    if (!downloadResponse.body) {
+      throw new Error("Storage download failed: missing response stream");
+    }
 
     await updateJob(job.id, "processing", "Downloading source file to worker disk");
     const sourceFile = createWriteStream(localPath, { flags: "w" });
-    await pipeline(data.stream(), sourceFile);
+    await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
 
