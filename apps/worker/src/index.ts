@@ -78,6 +78,62 @@ async function processJob(job: any) {
   await updateJob(job.id, "completed", "Imported and indexed");
 }
 
+async function updateJob(id: number, status: string, logs: string) {
+  const { error } = await supabase.from("gis_processing_jobs").update({ status, logs }).eq("id", id);
+  if (error) {
+    console.error(`Failed to update job ${id} status to ${status}:`, error.message);
+  }
+}
+
+async function runCommand(name: string, file: string, args: string[], timeoutMs = 15 * 60 * 1000) {
+  console.log(`[job] ${name} start`);
+  const { stdout, stderr } = await exec(file, args, { timeout: timeoutMs, maxBuffer: 20 * 1024 * 1024 });
+  if (stdout?.trim()) console.log(`[job] ${name} stdout:\n${stdout.trim()}`);
+  if (stderr?.trim()) console.log(`[job] ${name} stderr:\n${stderr.trim()}`);
+  console.log(`[job] ${name} done`);
+}
+
+async function processJob(job: any) {
+  await updateJob(job.id, "processing", "Downloading upload from storage");
+
+  await mkdir("/tmp/gml", { recursive: true });
+  const sourceExt = extname(job.original_filename ?? "").toLowerCase();
+  const localExt = sourceExt === ".zip" ? ".zip" : ".gml";
+  const localPath = `/tmp/gml/${job.id}${localExt}`;
+
+  const { data, error: downloadError } = await supabase.storage.from("gis-uploads").download(job.storage_path);
+  if (downloadError) throw new Error(`Storage download failed: ${downloadError.message}`);
+  if (!data) throw new Error("Failed to download source file from storage");
+
+  await writeFile(localPath, Buffer.from(await data.arrayBuffer()));
+  await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
+
+  await runCommand(
+    "ogr2ogr",
+    "ogr2ogr",
+    [
+      "-f",
+      "PostgreSQL",
+      dbUrl,
+      localPath,
+      "-nln",
+      "staging_parcels",
+      "-nlt",
+      "PROMOTE_TO_MULTI",
+      "-lco",
+      "GEOMETRY_NAME=geom",
+      "-t_srs",
+      "EPSG:4326",
+      "-overwrite"
+    ]
+  );
+
+  await updateJob(job.id, "processing", "Running finalize.sql");
+  await runCommand("psql finalize", "psql", [process.env.POSTGRES_DSN!, "-f", "/app/sql/finalize.sql"]);
+
+  await updateJob(job.id, "completed", "Imported and indexed");
+}
+
 async function run() {
   while (true) {
     try {
