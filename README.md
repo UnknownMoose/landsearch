@@ -1,10 +1,12 @@
 # Landsearch MVP (GML -> PostGIS -> Vector Tiles -> MapLibre)
 
-Monorepo structure:
-- `apps/web` Next.js App Router frontend and admin GIS upload UI (`/admin/gis`)
-- `apps/worker` Railway worker for async GDAL `ogr2ogr` imports
-- `apps/tileserver` pg_tileserv deployment notes
-- `packages/db` SQL setup for PostGIS tables + job queue
-- `docs/supabase-setup.md` full Supabase setup guide
+Production footprint:
+- Vercel: Next.js frontend + vector tile API endpoint
+- Supabase: PostGIS + Storage + job queue
+- Tiny worker (Railway/Render): only GDAL `ogr2ogr` imports
 
-Core architecture avoids browser GIS parsing and giant GeoJSON.
+Monorepo structure:
+- `apps/web` Next.js App Router frontend, admin GIS upload UI (`/admin/gis`), and `/api/tiles/parcels/{z}/{x}/{y}` MVT endpoint.
+- `apps/worker` async GML import worker.
+- `packages/db` SQL setup for PostGIS tables + queue.
+- `docs/supabase-setup.md` full setup guide.

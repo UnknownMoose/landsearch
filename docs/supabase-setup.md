@@ -25,7 +25,8 @@ Recommended:
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 - `SUPABASE_SERVICE_ROLE_KEY` (server-side only)
-- `NEXT_PUBLIC_TILESERVER_URL`
+- `NEXT_PUBLIC_TILESERVER_URL` (set to your Vercel app URL, e.g. `https://yourapp.vercel.app`)
+- `POSTGRES_DSN` (server-side tile endpoint on Vercel)
 
 ### Worker (Railway)
 - `SUPABASE_URL`
@@ -33,7 +34,7 @@ Recommended:
 - `POSTGRES_OGR_DSN` (e.g. `PG:host=... dbname=... user=... password=... sslmode=require`)
 - `POSTGRES_DSN` (psql DSN for finalize SQL)
 
-### pg_tileserv
+### Optional pg_tileserv (not required if using Vercel tile endpoint)
 - `DATABASE_URL`
 
 ## 5) Queue + Processing Flow
@@ -60,3 +61,8 @@ ogr2ogr -f PostgreSQL \
 - Keep parcel delivery tile-based through `pg_tileserv`.
 - Use database-side filtering/scoring tables for V2 and V3 intelligence layers.
 - Partition parcel tables by geography/date when national scale grows.
+
+
+## 8) Vercel-only tile serving
+Use the built-in Next.js tile endpoint at `/api/tiles/parcels/{z}/{x}/{y}`.
+This keeps production stack to Vercel + Supabase, with Railway/Render only for GML worker jobs.
