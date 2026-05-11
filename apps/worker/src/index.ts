@@ -131,7 +131,10 @@ server.listen(port, () => {
 });
 
 // Start the polling loop
-run();
+run().catch((e) => {
+  console.error("Fatal error in worker loop:", e);
+  process.exit(1);
+});
 
 
 let isShuttingDown = false;
