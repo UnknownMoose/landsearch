@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { getSupabaseBrowser } from "@/lib/supabase";
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
@@ -113,15 +113,43 @@ export default function AdminGisPage() {
 
 function JobTable() {
   const [jobs, setJobs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function refresh() {
-    const res = await fetch("/api/jobs");
-    setJobs(await res.json());
+    setLoading(true);
+    setError(null);
+
+    const res = await fetch("/api/jobs", { cache: "no-store" });
+    const payload = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      setJobs([]);
+      setError(payload?.error ?? "Failed to load job queue");
+      setLoading(false);
+      return;
+    }
+
+    if (Array.isArray(payload)) {
+      setJobs(payload);
+      setLoading(false);
+      return;
+    }
+
+    setJobs([]);
+    setError("Unexpected queue response format");
+    setLoading(false);
   }
+
+  useEffect(() => {
+    refresh();
+  }, []);
 
   return (
     <section className="space-y-2">
-      <button onClick={refresh} className="rounded border border-zinc-700 px-3 py-2">Refresh Queue</button>
+      <button onClick={refresh} className="rounded border border-zinc-700 px-3 py-2">{loading ? "Refreshing..." : "Refresh Queue"}</button>
+      {error ? <p className="text-sm text-red-400">Queue error: {error}</p> : null}
+      {!error && jobs.length === 0 ? <p className="text-sm text-zinc-400">No queue jobs yet.</p> : null}
       <table className="w-full text-left text-sm">
         <thead><tr><th>ID</th><th>Status</th><th>Logs</th></tr></thead>
         <tbody>
