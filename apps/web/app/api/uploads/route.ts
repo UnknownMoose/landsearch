@@ -6,10 +6,21 @@ export async function POST(req: Request) {
   const file = formData.get("file") as File | null;
   if (!file) return NextResponse.json({ error: "Missing file" }, { status: 400 });
 
+  const lowerName = file.name.toLowerCase();
+  const isGml = lowerName.endsWith(".gml");
+  const isZip = lowerName.endsWith(".zip");
+  if (!isGml && !isZip) {
+    return NextResponse.json({ error: "Unsupported file type. Please upload .gml or .zip." }, { status: 400 });
+  }
+
+  const contentType = isZip ? "application/zip" : "application/gml+xml";
+  const bytes = await file.arrayBuffer();
+  const blob = new Blob([bytes], { type: contentType });
+
   const objectPath = `gml/${Date.now()}-${file.name}`;
   const { error: uploadError } = await supabaseAdmin.storage
     .from("gis-uploads")
-    .upload(objectPath, file, { upsert: false });
+    .upload(objectPath, blob, { upsert: false, contentType });
 
   if (uploadError) return NextResponse.json({ error: uploadError.message }, { status: 500 });
 

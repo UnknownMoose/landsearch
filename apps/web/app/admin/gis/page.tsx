@@ -5,14 +5,30 @@ import { useState } from "react";
 export default function AdminGisPage() {
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState("idle");
+  const [error, setError] = useState<string | null>(null);
 
   async function upload() {
     if (!file) return;
     setStatus("uploading");
+    setError(null);
     const form = new FormData();
     form.append("file", file);
     const res = await fetch("/api/uploads", { method: "POST", body: form });
-    setStatus(res.ok ? "queued" : "error");
+    if (res.ok) {
+      setStatus("queued");
+      return;
+    }
+
+    let message = "Upload failed";
+    try {
+      const payload = await res.json();
+      if (payload?.error) message = payload.error;
+    } catch {
+      // no-op; keep fallback message
+    }
+
+    setStatus("error");
+    setError(message);
   }
 
   return (
@@ -22,6 +38,7 @@ export default function AdminGisPage() {
         <input type="file" accept=".gml,.zip" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
         <button onClick={upload} className="ml-3 rounded bg-emerald-600 px-3 py-2">Upload & Queue</button>
         <p className="mt-2 text-sm text-zinc-300">Status: {status}</p>
+        {error ? <p className="mt-1 text-sm text-red-400">Error: {error}</p> : null}
       </div>
       <JobTable />
     </main>
