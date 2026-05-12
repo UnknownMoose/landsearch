@@ -22,6 +22,9 @@ const dbUrl = requireEnv("POSTGRES_OGR_DSN");
 const postgresDsn = requireEnv("POSTGRES_DSN");
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+let lastPollAt: string | null = null;
+let lastClaimedJobAt: string | null = null;
+let lastCompletedJobAt: string | null = null;
 
 async function updateJob(id: number, status: string, logs: string) {
   const { error } = await supabase.from("gis_processing_jobs").update({ status, logs }).eq("id", id);
@@ -31,10 +34,12 @@ async function updateJob(id: number, status: string, logs: string) {
 }
 
 async function claimNextQueuedJob() {
+  lastPollAt = new Date().toISOString();
   const { data: nextJob, error: pollError } = await supabase
     .from("gis_processing_jobs")
     .select("id")
     .eq("status", "queued")
+    .eq("is_active", true)
     .order("created_at", { ascending: true })
     .limit(1)
     .maybeSingle();
@@ -57,6 +62,9 @@ async function claimNextQueuedJob() {
     throw new Error(`Failed to claim queued job ${nextJob.id}: ${claimError.message}`);
   }
 
+  if (claimedJob) {
+    lastClaimedJobAt = new Date().toISOString();
+  }
   return claimedJob;
 }
 
@@ -392,17 +400,21 @@ async function processJob(job: any) {
 }
 
 async function run() {
+  console.log("[worker] polling loop started");
   while (true) {
     try {
       const job = await claimNextQueuedJob();
 
       if (!job) {
+        console.log(`[worker] no queued jobs (last poll ${lastPollAt})`);
         await new Promise((r) => setTimeout(r, 4000));
         continue;
       }
+      console.log(`[worker] claimed job ${job.id}`);
 
       try {
         await processJob(job);
+        lastCompletedJobAt = new Date().toISOString();
       } catch (e: any) {
         console.error(`Job ${job.id} failed:`, e?.message ?? e);
         await updateJob(job.id, "failed", e?.message ?? "Unknown worker error");
@@ -417,8 +429,15 @@ async function run() {
 // Start HTTP health server for Railway
 const server = http.createServer((req, res) => {
   if (req.url === "/health" || req.url === "/") {
-    res.writeHead(200);
-    res.end("ok");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        lastPollAt,
+        lastClaimedJobAt,
+        lastCompletedJobAt
+      })
+    );
     return;
   }
 
