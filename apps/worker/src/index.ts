@@ -199,8 +199,8 @@ async function createSignedDownloadUrl(storagePath: string) {
   const { data: signedData, error: signedUrlError } = await supabase.storage
     .from("gis-uploads")
     .createSignedUrl(storagePath, 60 * 60);
-  if (signedUrlError) throw new Error(`Failed to create signed URL: ${signedUrlError.message}`);
-  if (!signedData?.signedUrl) throw new Error("Failed to create signed URL for source file");
+  if (signedUrlError) throw new Error(`Failed to create signed URL for "${storagePath}": ${signedUrlError.message}`);
+  if (!signedData?.signedUrl) throw new Error(`Failed to create signed URL for source file "${storagePath}"`);
   return signedData.signedUrl;
 }
 
@@ -249,6 +249,19 @@ async function downloadToFileWithRetry(
 
 async function processJob(job: any) {
   await updateJob(job.id, "processing", "Downloading upload from storage");
+  console.log(`[job ${job.id}] starting with storage_path="${job.storage_path}" filename="${job.original_filename}"`);
+
+  const postgresJobExistsRaw = await runCommandCapture("postgres job existence check", "psql", [
+    postgresDsn,
+    "-tAc",
+    `select count(*) from public.gis_processing_jobs where id = ${Number(job.id)};`
+  ]);
+  const postgresJobExists = Number.parseInt(postgresJobExistsRaw, 10);
+  if (!Number.isFinite(postgresJobExists) || postgresJobExists <= 0) {
+    throw new Error(
+      `Job ${job.id} exists in Supabase queue but not in POSTGRES_DSN database. Check DB env alignment between Supabase and worker Postgres DSNs.`
+    );
+  }
 
   await mkdir("/tmp/gml", { recursive: true });
   const sourceExt = extname(job.original_filename ?? "").toLowerCase();
