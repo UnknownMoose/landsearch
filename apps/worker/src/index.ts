@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, rm, access } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { extname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import http from "node:http";
@@ -166,11 +167,16 @@ function sleep(ms: number) {
 
 async function resolveFinalizeSqlPath() {
   if (process.env.FINALIZE_SQL_PATH) {
+    console.log(`[job] Using FINALIZE_SQL_PATH override: ${process.env.FINALIZE_SQL_PATH}`);
     return process.env.FINALIZE_SQL_PATH;
   }
 
+  const moduleDir = resolve(fileURLToPath(new URL(".", import.meta.url)));
   const candidatePaths = [
     "/app/sql/finalize.sql",
+    resolve(moduleDir, "../sql/finalize.sql"),
+    resolve(moduleDir, "../../sql/finalize.sql"),
+    resolve(moduleDir, "../../../sql/finalize.sql"),
     resolve(process.cwd(), "sql/finalize.sql"),
     resolve(process.cwd(), "../sql/finalize.sql"),
     resolve(process.cwd(), "../../sql/finalize.sql")
@@ -179,6 +185,7 @@ async function resolveFinalizeSqlPath() {
   for (const candidate of candidatePaths) {
     try {
       await access(candidate);
+      console.log(`[job] Resolved finalize.sql path: ${candidate}`);
       return candidate;
     } catch {
       // try next candidate
@@ -190,10 +197,15 @@ async function resolveFinalizeSqlPath() {
 
 async function downloadToFileWithRetry(url: string, localPath: string, attempts = 3) {
   let lastError: unknown = null;
+  const timeoutMs = 10 * 60 * 1000;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const downloadResponse = await fetch(url);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+      const downloadResponse = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
       if (!downloadResponse.ok) {
         throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
       }
@@ -203,6 +215,7 @@ async function downloadToFileWithRetry(url: string, localPath: string, attempts 
 
       const sourceFile = createWriteStream(localPath, { flags: "w" });
       await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
+      console.log(`[job] Download succeeded on attempt ${attempt}/${attempts}`);
       return;
     } catch (error) {
       lastError = error;
@@ -300,6 +313,7 @@ async function processJob(job: any) {
 
     await updateJob(job.id, "processing", "Running finalize.sql");
     const finalizeSqlPath = await resolveFinalizeSqlPath();
+    await updateJob(job.id, "processing", `Running finalize.sql at: ${finalizeSqlPath}`);
     await runCommand("psql finalize", "psql", [postgresDsn, "-f", finalizeSqlPath]);
 
     const parcelCountRaw = await runCommandCapture("parcel table count", "psql", [
