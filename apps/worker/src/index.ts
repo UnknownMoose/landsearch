@@ -115,6 +115,51 @@ async function runCommand(
   });
 }
 
+async function runCommandCapture(name: string, file: string, args: string[], timeoutMs = 5 * 60 * 1000) {
+  console.log(`[job] ${name} start`);
+  let stdout = "";
+  let stderr = "";
+
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    const child = spawn(file, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env
+    });
+
+    const killTimer = setTimeout(() => {
+      console.error(`[job] ${name} timed out after ${timeoutMs}ms`);
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (error) => {
+      clearTimeout(killTimer);
+      reject(error);
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(killTimer);
+      resolve(code ?? 1);
+    });
+  });
+
+  if (stderr.trim()) {
+    console.log(`[job] ${name} stderr:\n${stderr.trim()}`);
+  }
+  if (exitCode !== 0) {
+    throw new Error(`${name} exited with code ${exitCode}`);
+  }
+  console.log(`[job] ${name} done`);
+  return stdout.trim();
+}
+
 async function processJob(job: any) {
   await updateJob(job.id, "processing", "Downloading upload from storage");
 
@@ -181,6 +226,16 @@ async function processJob(job: any) {
         GDAL_CACHEMAX: "64"
       }
     );
+
+    const stagedRowCountRaw = await runCommandCapture("staging row count", "psql", [
+      postgresDsn,
+      "-tAc",
+      "select count(*) from public.staging_parcels;"
+    ]);
+    const stagedRowCount = Number.parseInt(stagedRowCountRaw, 10);
+    if (!Number.isFinite(stagedRowCount) || stagedRowCount <= 0) {
+      throw new Error(`No rows were imported into staging_parcels (count=${stagedRowCountRaw || "unknown"})`);
+    }
 
     await updateJob(job.id, "processing", "Running finalize.sql");
     await runCommand("psql finalize", "psql", [postgresDsn, "-f", "/app/sql/finalize.sql"]);
