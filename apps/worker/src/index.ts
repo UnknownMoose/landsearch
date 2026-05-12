@@ -59,12 +59,29 @@ async function claimNextQueuedJob() {
   return claimedJob;
 }
 
-async function runCommand(name: string, file: string, args: string[], timeoutMs = 15 * 60 * 1000) {
+function logMemory(context: string) {
+  const rssMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+  const heapUsedMb = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+  console.log(`[mem] ${context} rss=${rssMb}MB heapUsed=${heapUsedMb}MB`);
+}
+
+async function runCommand(
+  name: string,
+  file: string,
+  args: string[],
+  timeoutMs = 15 * 60 * 1000,
+  envOverrides: Record<string, string> = {}
+) {
   console.log(`[job] ${name} start`);
+  logMemory(`${name} before spawn`);
 
   await new Promise<void>((resolve, reject) => {
     const child = spawn(file, args, {
-      stdio: ["ignore", "inherit", "inherit"]
+      stdio: ["ignore", "inherit", "inherit"],
+      env: {
+        ...process.env,
+        ...envOverrides
+      }
     });
 
     const killTimer = setTimeout(() => {
@@ -92,6 +109,7 @@ async function runCommand(name: string, file: string, args: string[], timeoutMs 
       }
 
       console.log(`[job] ${name} done`);
+      logMemory(`${name} after completion`);
       resolve();
     });
   });
@@ -125,6 +143,7 @@ async function processJob(job: any) {
     await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
+    await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
 
     await runCommand(
       "ogr2ogr",
@@ -140,10 +159,27 @@ async function processJob(job: any) {
         "PROMOTE_TO_MULTI",
         "-lco",
         "GEOMETRY_NAME=geom",
+        "-gt",
+        "2000",
+        "--config",
+        "PG_USE_COPY",
+        "YES",
+        "--config",
+        "CPL_TMPDIR",
+        "/tmp",
+        "--config",
+        "VSI_CACHE",
+        "FALSE",
         "-t_srs",
         "EPSG:4326",
         "-overwrite"
-      ]
+      ],
+      30 * 60 * 1000,
+      {
+        OGR_WFS_PAGING_ALLOWED: "YES",
+        OGR_SQLITE_CACHE: "0",
+        GDAL_CACHEMAX: "64"
+      }
     );
 
     await updateJob(job.id, "processing", "Running finalize.sql");
