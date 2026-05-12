@@ -1,7 +1,11 @@
 insert into public.parcels (title_number, inspire_id, geom, area_m2, area_hectares, area_acres, centroid)
 select
-  nullif(title_number::text, ''),
-  coalesce(inspire_id::text, ogc_fid::text),
+  null::text as title_number,
+  coalesce(
+    nullif(nationalcadastralreference::text, ''),
+    nullif(inspireid::text, ''),
+    ogc_fid::text
+  ) as inspire_id,
   st_multi(geom)::geometry(MultiPolygon, 4326),
   st_area(geography(st_transform(geom, 4326))) as area_m2,
   st_area(geography(st_transform(geom, 4326))) / 10000.0 as area_hectares,
