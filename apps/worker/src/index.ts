@@ -161,6 +161,15 @@ async function runCommandCapture(name: string, file: string, args: string[], tim
   return stdout.trim();
 }
 
+async function getDbIdentity(dsn: string, label: string) {
+  const raw = await runCommandCapture(`${label} identity`, "psql", [
+    dsn,
+    "-tAc",
+    "select concat_ws('|', current_database(), coalesce(inet_server_addr()::text,'local'), inet_server_port()::text);"
+  ]);
+  return raw;
+}
+
 function sleep(ms: number) {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
@@ -202,6 +211,19 @@ async function createSignedDownloadUrl(storagePath: string) {
   if (signedUrlError) throw new Error(`Failed to create signed URL for "${storagePath}": ${signedUrlError.message}`);
   if (!signedData?.signedUrl) throw new Error(`Failed to create signed URL for source file "${storagePath}"`);
   return signedData.signedUrl;
+}
+
+async function downloadViaSupabaseAdmin(storagePath: string, localPath: string) {
+  const { data, error } = await supabase.storage.from("gis-uploads").download(storagePath);
+  if (error) {
+    throw new Error(`Supabase admin download failed for "${storagePath}": ${error.message}`);
+  }
+  if (!data) {
+    throw new Error(`Supabase admin download returned no data for "${storagePath}"`);
+  }
+
+  const sourceFile = createWriteStream(localPath, { flags: "w" });
+  await pipeline(Readable.fromWeb(data.stream() as any), sourceFile);
 }
 
 async function downloadToFileWithRetry(
@@ -263,6 +285,14 @@ async function processJob(job: any) {
     );
   }
 
+  const ogrIdentity = await getDbIdentity(dbUrl, "POSTGRES_OGR_DSN");
+  const psqlIdentity = await getDbIdentity(postgresDsn, "POSTGRES_DSN");
+  if (ogrIdentity !== psqlIdentity) {
+    throw new Error(
+      `POSTGRES_OGR_DSN and POSTGRES_DSN target different databases (ogr=${ogrIdentity}, psql=${psqlIdentity}).`
+    );
+  }
+
   await mkdir("/tmp/gml", { recursive: true });
   const sourceExt = extname(job.original_filename ?? "").toLowerCase();
   const localExt = sourceExt === ".zip" ? ".zip" : ".gml";
@@ -270,7 +300,13 @@ async function processJob(job: any) {
 
   try {
     await updateJob(job.id, "processing", "Downloading source file to worker disk");
-    await downloadToFileWithRetry(() => createSignedDownloadUrl(job.storage_path), localPath, 3);
+    try {
+      await downloadViaSupabaseAdmin(job.storage_path, localPath);
+      console.log(`[job ${job.id}] Downloaded via Supabase admin storage API`);
+    } catch (adminDownloadError) {
+      console.warn(`[job ${job.id}] Admin storage download failed, falling back to signed URL:`, adminDownloadError);
+      await downloadToFileWithRetry(() => createSignedDownloadUrl(job.storage_path), localPath, 3);
+    }
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
     await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
