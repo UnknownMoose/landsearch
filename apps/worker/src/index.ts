@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { extname } from "node:path";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import http from "node:http";
 
@@ -26,6 +27,36 @@ async function updateJob(id: number, status: string, logs: string) {
   if (error) {
     console.error(`Failed to update job ${id} status to ${status}:`, error.message);
   }
+}
+
+async function claimNextQueuedJob() {
+  const { data: nextJob, error: pollError } = await supabase
+    .from("gis_processing_jobs")
+    .select("id")
+    .eq("status", "queued")
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (pollError) {
+    throw new Error(`Failed to poll queued jobs: ${pollError.message}`);
+  }
+
+  if (!nextJob) return null;
+
+  const { data: claimedJob, error: claimError } = await supabase
+    .from("gis_processing_jobs")
+    .update({ status: "processing", logs: "Worker claimed job" })
+    .eq("id", nextJob.id)
+    .eq("status", "queued")
+    .select("*")
+    .maybeSingle();
+
+  if (claimError) {
+    throw new Error(`Failed to claim queued job ${nextJob.id}: ${claimError.message}`);
+  }
+
+  return claimedJob;
 }
 
 async function runCommand(name: string, file: string, args: string[], timeoutMs = 15 * 60 * 1000) {
@@ -75,13 +106,23 @@ async function processJob(job: any) {
   const localPath = `/tmp/gml/${job.id}${localExt}`;
 
   try {
-    const { data, error: downloadError } = await supabase.storage.from("gis-uploads").download(job.storage_path);
-    if (downloadError) throw new Error(`Storage download failed: ${downloadError.message}`);
-    if (!data) throw new Error("Failed to download source file from storage");
+    const { data: signedData, error: signedUrlError } = await supabase.storage
+      .from("gis-uploads")
+      .createSignedUrl(job.storage_path, 60 * 15);
+    if (signedUrlError) throw new Error(`Failed to create signed URL: ${signedUrlError.message}`);
+    if (!signedData?.signedUrl) throw new Error("Failed to create signed URL for source file");
+
+    const downloadResponse = await fetch(signedData.signedUrl);
+    if (!downloadResponse.ok) {
+      throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
+    }
+    if (!downloadResponse.body) {
+      throw new Error("Storage download failed: missing response stream");
+    }
 
     await updateJob(job.id, "processing", "Downloading source file to worker disk");
     const sourceFile = createWriteStream(localPath, { flags: "w" });
-    await pipeline(data.stream(), sourceFile);
+    await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
 
@@ -117,19 +158,7 @@ async function processJob(job: any) {
 async function run() {
   while (true) {
     try {
-      const { data: job, error } = await supabase
-        .from("gis_processing_jobs")
-        .select("*")
-        .eq("status", "queued")
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (error) {
-        console.error("Failed to poll queued jobs:", error.message);
-        await new Promise((r) => setTimeout(r, 4000));
-        continue;
-      }
+      const job = await claimNextQueuedJob();
 
       if (!job) {
         await new Promise((r) => setTimeout(r, 4000));
