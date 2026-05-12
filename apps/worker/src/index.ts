@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, rm, access } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { extname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import http from "node:http";
@@ -166,11 +167,16 @@ function sleep(ms: number) {
 
 async function resolveFinalizeSqlPath() {
   if (process.env.FINALIZE_SQL_PATH) {
+    console.log(`[job] Using FINALIZE_SQL_PATH override: ${process.env.FINALIZE_SQL_PATH}`);
     return process.env.FINALIZE_SQL_PATH;
   }
 
+  const moduleDir = resolve(fileURLToPath(new URL(".", import.meta.url)));
   const candidatePaths = [
     "/app/sql/finalize.sql",
+    resolve(moduleDir, "../sql/finalize.sql"),
+    resolve(moduleDir, "../../sql/finalize.sql"),
+    resolve(moduleDir, "../../../sql/finalize.sql"),
     resolve(process.cwd(), "sql/finalize.sql"),
     resolve(process.cwd(), "../sql/finalize.sql"),
     resolve(process.cwd(), "../../sql/finalize.sql")
@@ -179,6 +185,7 @@ async function resolveFinalizeSqlPath() {
   for (const candidate of candidatePaths) {
     try {
       await access(candidate);
+      console.log(`[job] Resolved finalize.sql path: ${candidate}`);
       return candidate;
     } catch {
       // try next candidate
@@ -188,12 +195,31 @@ async function resolveFinalizeSqlPath() {
   throw new Error(`Could not find finalize.sql. Tried: ${candidatePaths.join(", ")}.`);
 }
 
-async function downloadToFileWithRetry(url: string, localPath: string, attempts = 3) {
+async function createSignedDownloadUrl(storagePath: string) {
+  const { data: signedData, error: signedUrlError } = await supabase.storage
+    .from("gis-uploads")
+    .createSignedUrl(storagePath, 60 * 60);
+  if (signedUrlError) throw new Error(`Failed to create signed URL: ${signedUrlError.message}`);
+  if (!signedData?.signedUrl) throw new Error("Failed to create signed URL for source file");
+  return signedData.signedUrl;
+}
+
+async function downloadToFileWithRetry(
+  getSignedUrl: () => Promise<string>,
+  localPath: string,
+  attempts = 3
+) {
   let lastError: unknown = null;
+  const timeoutMs = 10 * 60 * 1000;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let timeout: NodeJS.Timeout | null = null;
     try {
-      const downloadResponse = await fetch(url);
+      const signedUrl = await getSignedUrl();
+      const controller = new AbortController();
+      timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+      const downloadResponse = await fetch(signedUrl, { signal: controller.signal });
       if (!downloadResponse.ok) {
         throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
       }
@@ -203,6 +229,7 @@ async function downloadToFileWithRetry(url: string, localPath: string, attempts 
 
       const sourceFile = createWriteStream(localPath, { flags: "w" });
       await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
+      console.log(`[job] Download succeeded on attempt ${attempt}/${attempts}`);
       return;
     } catch (error) {
       lastError = error;
@@ -210,6 +237,8 @@ async function downloadToFileWithRetry(url: string, localPath: string, attempts 
       const backoffMs = attempt * 1000;
       console.warn(`Download attempt ${attempt}/${attempts} failed, retrying in ${backoffMs}ms...`);
       await sleep(backoffMs);
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
 
@@ -227,14 +256,8 @@ async function processJob(job: any) {
   const localPath = `/tmp/gml/${job.id}${localExt}`;
 
   try {
-    const { data: signedData, error: signedUrlError } = await supabase.storage
-      .from("gis-uploads")
-      .createSignedUrl(job.storage_path, 60 * 60);
-    if (signedUrlError) throw new Error(`Failed to create signed URL: ${signedUrlError.message}`);
-    if (!signedData?.signedUrl) throw new Error("Failed to create signed URL for source file");
-
     await updateJob(job.id, "processing", "Downloading source file to worker disk");
-    await downloadToFileWithRetry(signedData.signedUrl, localPath, 3);
+    await downloadToFileWithRetry(() => createSignedDownloadUrl(job.storage_path), localPath, 3);
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
     await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
@@ -300,6 +323,7 @@ async function processJob(job: any) {
 
     await updateJob(job.id, "processing", "Running finalize.sql");
     const finalizeSqlPath = await resolveFinalizeSqlPath();
+    await updateJob(job.id, "processing", `Running finalize.sql at: ${finalizeSqlPath}`);
     await runCommand("psql finalize", "psql", [postgresDsn, "-f", finalizeSqlPath]);
 
     const parcelCountRaw = await runCommandCapture("parcel table count", "psql", [
