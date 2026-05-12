@@ -237,8 +237,30 @@ async function processJob(job: any) {
       throw new Error(`No rows were imported into staging_parcels (count=${stagedRowCountRaw || "unknown"})`);
     }
 
+    const stagedGeomCountRaw = await runCommandCapture("staging non-null geom count", "psql", [
+      postgresDsn,
+      "-tAc",
+      "select count(*) from public.staging_parcels where geom is not null;"
+    ]);
+    const stagedGeomCount = Number.parseInt(stagedGeomCountRaw, 10);
+    if (!Number.isFinite(stagedGeomCount) || stagedGeomCount <= 0) {
+      throw new Error(
+        `Staging import has no non-null geometries (geom_count=${stagedGeomCountRaw || "unknown"}, total=${stagedRowCount})`
+      );
+    }
+
     await updateJob(job.id, "processing", "Running finalize.sql");
     await runCommand("psql finalize", "psql", [postgresDsn, "-f", "/app/sql/finalize.sql"]);
+
+    const parcelCountRaw = await runCommandCapture("parcel table count", "psql", [
+      postgresDsn,
+      "-tAc",
+      "select count(*) from public.parcels;"
+    ]);
+    const parcelCount = Number.parseInt(parcelCountRaw, 10);
+    if (!Number.isFinite(parcelCount) || parcelCount <= 0) {
+      throw new Error(`Finalize completed but parcels is still empty (count=${parcelCountRaw || "unknown"})`);
+    }
 
     await updateJob(job.id, "completed", "Imported and indexed");
   } finally {
