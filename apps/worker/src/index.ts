@@ -22,6 +22,12 @@ const dbUrl = requireEnv("POSTGRES_OGR_DSN");
 const postgresDsn = requireEnv("POSTGRES_DSN");
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+console.log("=== WORKER STARTED ===");
+console.log("SUPABASE_URL:", supabaseUrl ? "present" : "MISSING");
+console.log("POSTGRES_OGR_DSN:", dbUrl ? "present" : "MISSING");
+console.log("POSTGRES_DSN:", postgresDsn ? "present" : "MISSING");
+logMemory("startup");
+
 let lastPollAt: string | null = null;
 let lastClaimedJobAt: string | null = null;
 let lastCompletedJobAt: string | null = null;
@@ -219,69 +225,41 @@ async function resolveFinalizeSqlPath() {
   throw new Error(`Could not find finalize.sql. Tried: ${candidatePaths.join(", ")}.`);
 }
 
-async function createSignedDownloadUrl(storagePath: string) {
-  const { data: signedData, error: signedUrlError } = await supabase.storage
+async function downloadToFile(storagePath: string, localPath: string) {
+  console.log(`[job] Downloading ${storagePath} to ${localPath}`);
+
+  // Primary: Admin client download (service_role bypasses everything)
+  try {
+    const { data, error } = await supabase.storage.from("gis-uploads").download(storagePath);
+
+    if (error) throw error;
+    if (!data) throw new Error("No data returned from download");
+
+    const sourceFile = createWriteStream(localPath);
+    await pipeline(Readable.fromWeb(data.stream() as any), sourceFile);
+    console.log("[job] Download succeeded via admin client");
+    return;
+  } catch (adminErr: any) {
+    console.warn("[job] Admin download failed:", adminErr.message);
+  }
+
+  // Fallback: Signed URL
+  console.log("[job] Falling back to signed URL...");
+  const { data: signedData, error: signedErr } = await supabase.storage
     .from("gis-uploads")
-    .createSignedUrl(storagePath, 60 * 60);
-  if (signedUrlError) throw new Error(`Failed to create signed URL for "${storagePath}": ${signedUrlError.message}`);
-  if (!signedData?.signedUrl) throw new Error(`Failed to create signed URL for source file "${storagePath}"`);
-  return signedData.signedUrl;
-}
+    .createSignedUrl(storagePath, 3600);
 
-async function downloadViaSupabaseAdmin(storagePath: string, localPath: string) {
-  const { data, error } = await supabase.storage.from("gis-uploads").download(storagePath);
-  if (error) {
-    throw new Error(`Supabase admin download failed for "${storagePath}": ${error.message}`);
-  }
-  if (!data) {
-    throw new Error(`Supabase admin download returned no data for "${storagePath}"`);
+  if (signedErr || !signedData?.signedUrl) {
+    throw new Error(`Signed URL failed: ${signedErr?.message}`);
   }
 
-  const sourceFile = createWriteStream(localPath, { flags: "w" });
-  await pipeline(Readable.fromWeb(data.stream() as any), sourceFile);
-}
+  const res = await fetch(signedData.signedUrl);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.body) throw new Error("Missing response stream body");
 
-async function downloadToFileWithRetry(
-  getSignedUrl: () => Promise<string>,
-  localPath: string,
-  attempts = 3
-) {
-  let lastError: unknown = null;
-  const timeoutMs = 10 * 60 * 1000;
-
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    let timeout: NodeJS.Timeout | null = null;
-    try {
-      const signedUrl = await getSignedUrl();
-      const controller = new AbortController();
-      timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-      const downloadResponse = await fetch(signedUrl, { signal: controller.signal });
-      if (!downloadResponse.ok) {
-        throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
-      }
-      if (!downloadResponse.body) {
-        throw new Error("Storage download failed: missing response stream");
-      }
-
-      const sourceFile = createWriteStream(localPath, { flags: "w" });
-      await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
-      console.log(`[job] Download succeeded on attempt ${attempt}/${attempts}`);
-      return;
-    } catch (error) {
-      lastError = error;
-      if (attempt >= attempts) break;
-      const backoffMs = attempt * 1000;
-      console.warn(`Download attempt ${attempt}/${attempts} failed, retrying in ${backoffMs}ms...`);
-      await sleep(backoffMs);
-    } finally {
-      if (timeout) clearTimeout(timeout);
-    }
-  }
-
-  throw new Error(
-    `Storage download failed after ${attempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`
-  );
+  const sourceFile = createWriteStream(localPath);
+  await pipeline(Readable.fromWeb(res.body as any), sourceFile);
+  console.log("[job] Download succeeded via signed URL");
 }
 
 async function processJob(job: any) {
@@ -314,14 +292,8 @@ async function processJob(job: any) {
   const localPath = `/tmp/gml/${job.id}${localExt}`;
 
   try {
-    await updateJob(job.id, "processing", "Downloading source file to worker disk");
-    try {
-      await downloadViaSupabaseAdmin(job.storage_path, localPath);
-      console.log(`[job ${job.id}] Downloaded via Supabase admin storage API`);
-    } catch (adminDownloadError) {
-      console.warn(`[job ${job.id}] Admin storage download failed, falling back to signed URL:`, adminDownloadError);
-      await downloadToFileWithRetry(() => createSignedDownloadUrl(job.storage_path), localPath, 3);
-    }
+    await updateJob(job.id, "processing", "Downloading source file from storage");
+    await downloadToFile(job.storage_path, localPath);
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
     await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
