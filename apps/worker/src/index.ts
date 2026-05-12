@@ -1,8 +1,8 @@
 import { createClient } from "@supabase/supabase-js";
 import { spawn } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, access } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
-import { extname } from "node:path";
+import { extname, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import http from "node:http";
@@ -160,6 +160,64 @@ async function runCommandCapture(name: string, file: string, args: string[], tim
   return stdout.trim();
 }
 
+function sleep(ms: number) {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+async function resolveFinalizeSqlPath() {
+  if (process.env.FINALIZE_SQL_PATH) {
+    return process.env.FINALIZE_SQL_PATH;
+  }
+
+  const candidatePaths = [
+    "/app/sql/finalize.sql",
+    resolve(process.cwd(), "sql/finalize.sql"),
+    resolve(process.cwd(), "../sql/finalize.sql"),
+    resolve(process.cwd(), "../../sql/finalize.sql")
+  ];
+
+  for (const candidate of candidatePaths) {
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      // try next candidate
+    }
+  }
+
+  throw new Error(`Could not find finalize.sql. Tried: ${candidatePaths.join(", ")}.`);
+}
+
+async function downloadToFileWithRetry(url: string, localPath: string, attempts = 3) {
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const downloadResponse = await fetch(url);
+      if (!downloadResponse.ok) {
+        throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
+      }
+      if (!downloadResponse.body) {
+        throw new Error("Storage download failed: missing response stream");
+      }
+
+      const sourceFile = createWriteStream(localPath, { flags: "w" });
+      await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      const backoffMs = attempt * 1000;
+      console.warn(`Download attempt ${attempt}/${attempts} failed, retrying in ${backoffMs}ms...`);
+      await sleep(backoffMs);
+    }
+  }
+
+  throw new Error(
+    `Storage download failed after ${attempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`
+  );
+}
+
 async function processJob(job: any) {
   await updateJob(job.id, "processing", "Downloading upload from storage");
 
@@ -171,21 +229,12 @@ async function processJob(job: any) {
   try {
     const { data: signedData, error: signedUrlError } = await supabase.storage
       .from("gis-uploads")
-      .createSignedUrl(job.storage_path, 60 * 15);
+      .createSignedUrl(job.storage_path, 60 * 60);
     if (signedUrlError) throw new Error(`Failed to create signed URL: ${signedUrlError.message}`);
     if (!signedData?.signedUrl) throw new Error("Failed to create signed URL for source file");
 
-    const downloadResponse = await fetch(signedData.signedUrl);
-    if (!downloadResponse.ok) {
-      throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
-    }
-    if (!downloadResponse.body) {
-      throw new Error("Storage download failed: missing response stream");
-    }
-
     await updateJob(job.id, "processing", "Downloading source file to worker disk");
-    const sourceFile = createWriteStream(localPath, { flags: "w" });
-    await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
+    await downloadToFileWithRetry(signedData.signedUrl, localPath, 3);
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
     await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
@@ -250,7 +299,8 @@ async function processJob(job: any) {
     }
 
     await updateJob(job.id, "processing", "Running finalize.sql");
-    await runCommand("psql finalize", "psql", [postgresDsn, "-f", "/app/sql/finalize.sql"]);
+    const finalizeSqlPath = await resolveFinalizeSqlPath();
+    await runCommand("psql finalize", "psql", [postgresDsn, "-f", finalizeSqlPath]);
 
     const parcelCountRaw = await runCommandCapture("parcel table count", "psql", [
       postgresDsn,
