@@ -39,44 +39,49 @@ export default function AdminGisPage() {
     }
 
     const supabaseBrowser = getSupabaseBrowser();
-    if (!supabaseBrowser) {
-      setStatus("error");
-      setError("Missing NEXT_PUBLIC_SUPABASE_URL and a public key (NEXT_PUBLIC_SUPABASE_ANON_KEY or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY).");
-      return;
-    }
 
     setStatus("uploading");
     setError(null);
-    const signedRes = await fetch("/api/uploads/signed-url", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename: file.name })
-    });
+    let res: Response | null = null;
 
-    if (!signedRes.ok) {
-      setStatus("error");
-      const payload = await signedRes.json().catch(() => ({}));
-      setError(payload?.error ?? "Could not create signed upload URL");
-      return;
+    try {
+      if (supabaseBrowser) {
+        const signedRes = await fetch("/api/uploads/signed-url", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename: file.name })
+        });
+
+        if (signedRes.ok) {
+          const { token, storagePath } = await signedRes.json();
+          const { error: storageError } = await supabaseBrowser.storage
+            .from("gis-uploads")
+            .uploadToSignedUrl(storagePath, token, file);
+
+          if (!storageError) {
+            res = await fetch("/api/uploads", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ storagePath, originalFilename: file.name })
+            });
+          } else {
+            console.warn("Signed upload failed, using server upload fallback:", storageError.message);
+          }
+        } else {
+          console.warn("Could not create signed upload URL, using server upload fallback.");
+        }
+      } else {
+        console.warn("Missing browser Supabase config, using server upload fallback.");
+      }
+    } catch (signedFlowError) {
+      console.warn("Signed upload flow threw, using server upload fallback:", signedFlowError);
     }
 
-    const { token, storagePath } = await signedRes.json();
-
-    const { error: storageError } = await supabaseBrowser.storage
-      .from("gis-uploads")
-      .uploadToSignedUrl(storagePath, token, file);
-
-    if (storageError) {
-      setStatus("error");
-      setError(`Storage upload failed: ${storageError.message}`);
-      return;
+    if (!res) {
+      const formData = new FormData();
+      formData.append("file", file);
+      res = await fetch("/api/uploads", { method: "POST", body: formData });
     }
-
-    const res = await fetch("/api/uploads", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ storagePath, originalFilename: file.name })
-    });
     if (res.ok) {
       setStatus("queued");
       return;
