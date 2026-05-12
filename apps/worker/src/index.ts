@@ -25,9 +25,15 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 let lastPollAt: string | null = null;
 let lastClaimedJobAt: string | null = null;
 let lastCompletedJobAt: string | null = null;
+const jobLogHistory = new Map<number, string>();
 
 async function updateJob(id: number, status: string, logs: string) {
-  const { error } = await supabase.from("gis_processing_jobs").update({ status, logs }).eq("id", id);
+  const stampedLog = `[${new Date().toISOString()}] ${logs}`;
+  const existing = jobLogHistory.get(id);
+  const combinedLogs = existing ? `${existing}\n${stampedLog}` : stampedLog;
+  jobLogHistory.set(id, combinedLogs);
+
+  const { error } = await supabase.from("gis_processing_jobs").update({ status, logs: combinedLogs }).eq("id", id);
   if (error) {
     console.error(`Failed to update job ${id} status to ${status}:`, error.message);
   }
@@ -64,6 +70,7 @@ async function claimNextQueuedJob() {
 
   if (claimedJob) {
     lastClaimedJobAt = new Date().toISOString();
+    jobLogHistory.set(nextJob.id, `[${new Date().toISOString()}] Worker claimed job`);
   }
   return claimedJob;
 }
@@ -415,9 +422,11 @@ async function run() {
       try {
         await processJob(job);
         lastCompletedJobAt = new Date().toISOString();
+        jobLogHistory.delete(Number(job.id));
       } catch (e: any) {
         console.error(`Job ${job.id} failed:`, e?.message ?? e);
         await updateJob(job.id, "failed", e?.message ?? "Unknown worker error");
+        jobLogHistory.delete(Number(job.id));
       }
     } catch (e: any) {
       console.error("Worker loop error:", e?.message ?? e);
