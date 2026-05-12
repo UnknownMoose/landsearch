@@ -1,11 +1,11 @@
 import { createClient } from "@supabase/supabase-js";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { mkdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, rm } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
 import { extname } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import http from "node:http";
-
-const exec = promisify(execFile);
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -29,12 +29,135 @@ async function updateJob(id: number, status: string, logs: string) {
   }
 }
 
-async function runCommand(name: string, file: string, args: string[], timeoutMs = 15 * 60 * 1000) {
+async function claimNextQueuedJob() {
+  const { data: nextJob, error: pollError } = await supabase
+    .from("gis_processing_jobs")
+    .select("id")
+    .eq("status", "queued")
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (pollError) {
+    throw new Error(`Failed to poll queued jobs: ${pollError.message}`);
+  }
+
+  if (!nextJob) return null;
+
+  const { data: claimedJob, error: claimError } = await supabase
+    .from("gis_processing_jobs")
+    .update({ status: "processing", logs: "Worker claimed job" })
+    .eq("id", nextJob.id)
+    .eq("status", "queued")
+    .select("*")
+    .maybeSingle();
+
+  if (claimError) {
+    throw new Error(`Failed to claim queued job ${nextJob.id}: ${claimError.message}`);
+  }
+
+  return claimedJob;
+}
+
+function logMemory(context: string) {
+  const rssMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+  const heapUsedMb = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+  console.log(`[mem] ${context} rss=${rssMb}MB heapUsed=${heapUsedMb}MB`);
+}
+
+async function runCommand(
+  name: string,
+  file: string,
+  args: string[],
+  timeoutMs = 15 * 60 * 1000,
+  envOverrides: Record<string, string> = {}
+) {
   console.log(`[job] ${name} start`);
-  const { stdout, stderr } = await exec(file, args, { timeout: timeoutMs, maxBuffer: 20 * 1024 * 1024 });
-  if (stdout?.trim()) console.log(`[job] ${name} stdout:\n${stdout.trim()}`);
-  if (stderr?.trim()) console.log(`[job] ${name} stderr:\n${stderr.trim()}`);
+  logMemory(`${name} before spawn`);
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(file, args, {
+      stdio: ["ignore", "inherit", "inherit"],
+      env: {
+        ...process.env,
+        ...envOverrides
+      }
+    });
+
+    const killTimer = setTimeout(() => {
+      console.error(`[job] ${name} timed out after ${timeoutMs}ms`);
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+    }, timeoutMs);
+
+    child.on("error", (error) => {
+      clearTimeout(killTimer);
+      reject(error);
+    });
+
+    child.on("close", (code, signal) => {
+      clearTimeout(killTimer);
+
+      if (signal) {
+        reject(new Error(`${name} terminated by signal ${signal}`));
+        return;
+      }
+
+      if (code !== 0) {
+        reject(new Error(`${name} exited with code ${code}`));
+        return;
+      }
+
+      console.log(`[job] ${name} done`);
+      logMemory(`${name} after completion`);
+      resolve();
+    });
+  });
+}
+
+async function runCommandCapture(name: string, file: string, args: string[], timeoutMs = 5 * 60 * 1000) {
+  console.log(`[job] ${name} start`);
+  let stdout = "";
+  let stderr = "";
+
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    const child = spawn(file, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env
+    });
+
+    const killTimer = setTimeout(() => {
+      console.error(`[job] ${name} timed out after ${timeoutMs}ms`);
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (error) => {
+      clearTimeout(killTimer);
+      reject(error);
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(killTimer);
+      resolve(code ?? 1);
+    });
+  });
+
+  if (stderr.trim()) {
+    console.log(`[job] ${name} stderr:\n${stderr.trim()}`);
+  }
+  if (exitCode !== 0) {
+    throw new Error(`${name} exited with code ${exitCode}`);
+  }
   console.log(`[job] ${name} done`);
+  return stdout.trim();
 }
 
 async function processJob(job: any) {
@@ -45,55 +168,88 @@ async function processJob(job: any) {
   const localExt = sourceExt === ".zip" ? ".zip" : ".gml";
   const localPath = `/tmp/gml/${job.id}${localExt}`;
 
-  const { data, error: downloadError } = await supabase.storage.from("gis-uploads").download(job.storage_path);
-  if (downloadError) throw new Error(`Storage download failed: ${downloadError.message}`);
-  if (!data) throw new Error("Failed to download source file from storage");
+  try {
+    const { data: signedData, error: signedUrlError } = await supabase.storage
+      .from("gis-uploads")
+      .createSignedUrl(job.storage_path, 60 * 15);
+    if (signedUrlError) throw new Error(`Failed to create signed URL: ${signedUrlError.message}`);
+    if (!signedData?.signedUrl) throw new Error("Failed to create signed URL for source file");
 
-  await writeFile(localPath, Buffer.from(await data.arrayBuffer()));
-  await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
+    const downloadResponse = await fetch(signedData.signedUrl);
+    if (!downloadResponse.ok) {
+      throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
+    }
+    if (!downloadResponse.body) {
+      throw new Error("Storage download failed: missing response stream");
+    }
 
-  await runCommand(
-    "ogr2ogr",
-    "ogr2ogr",
-    [
-      "-f",
-      "PostgreSQL",
-      dbUrl,
-      localPath,
-      "-nln",
-      "staging_parcels",
-      "-nlt",
-      "PROMOTE_TO_MULTI",
-      "-lco",
-      "GEOMETRY_NAME=geom",
-      "-t_srs",
-      "EPSG:4326",
-      "-overwrite"
-    ]
-  );
+    await updateJob(job.id, "processing", "Downloading source file to worker disk");
+    const sourceFile = createWriteStream(localPath, { flags: "w" });
+    await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
 
-  await updateJob(job.id, "processing", "Running finalize.sql");
-  await runCommand("psql finalize", "psql", [postgresDsn, "-f", "/app/sql/finalize.sql"]);
+    await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
+    await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
 
-  await updateJob(job.id, "completed", "Imported and indexed");
+    await runCommand(
+      "ogr2ogr",
+      "ogr2ogr",
+      [
+        "-f",
+        "PostgreSQL",
+        dbUrl,
+        localPath,
+        "-nln",
+        "staging_parcels",
+        "-nlt",
+        "PROMOTE_TO_MULTI",
+        "-lco",
+        "GEOMETRY_NAME=geom",
+        "-gt",
+        "2000",
+        "--config",
+        "PG_USE_COPY",
+        "YES",
+        "--config",
+        "CPL_TMPDIR",
+        "/tmp",
+        "--config",
+        "VSI_CACHE",
+        "FALSE",
+        "-t_srs",
+        "EPSG:4326",
+        "-overwrite"
+      ],
+      30 * 60 * 1000,
+      {
+        OGR_WFS_PAGING_ALLOWED: "YES",
+        OGR_SQLITE_CACHE: "0",
+        GDAL_CACHEMAX: "64"
+      }
+    );
+
+    const stagedRowCountRaw = await runCommandCapture("staging row count", "psql", [
+      postgresDsn,
+      "-tAc",
+      "select count(*) from public.staging_parcels;"
+    ]);
+    const stagedRowCount = Number.parseInt(stagedRowCountRaw, 10);
+    if (!Number.isFinite(stagedRowCount) || stagedRowCount <= 0) {
+      throw new Error(`No rows were imported into staging_parcels (count=${stagedRowCountRaw || "unknown"})`);
+    }
+
+    await updateJob(job.id, "processing", "Running finalize.sql");
+    await runCommand("psql finalize", "psql", [postgresDsn, "-f", "/app/sql/finalize.sql"]);
+
+    await updateJob(job.id, "completed", "Imported and indexed");
+  } finally {
+    await rm(localPath, { force: true });
+  }
 }
 
 async function run() {
   while (true) {
     try {
-      const { data: job, error } = await supabase
-        .from("gis_processing_jobs")
-        .select("*")
-        .eq("status", "queued")
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (error) {
-        console.error("Failed to poll queued jobs:", error.message);
-        await new Promise((r) => setTimeout(r, 4000));
-        continue;
-      }
+      const job = await claimNextQueuedJob();
 
       if (!job) {
         await new Promise((r) => setTimeout(r, 4000));
