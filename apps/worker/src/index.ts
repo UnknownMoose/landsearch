@@ -410,14 +410,52 @@ async function run() {
   console.log("[worker] polling loop started");
   while (true) {
     try {
-      const job = await claimNextQueuedJob();
+      console.log("[poll] Checking for queued jobs...");
+      lastPollAt = new Date().toISOString();
+      const { data: nextJob, error: pollError } = await supabase
+        .from("gis_processing_jobs")
+        .select("*")
+        .eq("status", "queued")
+        .eq("is_active", true)
+        .order("created_at", { ascending: true })
+        .limit(1)
+        .maybeSingle();
 
-      if (!job) {
-        console.log(`[worker] no queued jobs (last poll ${lastPollAt})`);
+      if (pollError) {
+        console.error("[poll] Query error:", pollError.message);
         await new Promise((r) => setTimeout(r, 4000));
         continue;
       }
-      console.log(`[worker] claimed job ${job.id}`);
+
+      if (!nextJob) {
+        console.log("[poll] No queued jobs found");
+        await new Promise((r) => setTimeout(r, 4000));
+        continue;
+      }
+      console.log(`[poll] Found job ${nextJob.id}, attempting claim...`);
+
+      const { data: job, error: claimError } = await supabase
+        .from("gis_processing_jobs")
+        .update({ status: "processing", logs: "Worker claimed job" })
+        .eq("id", nextJob.id)
+        .eq("status", "queued")
+        .select("*")
+        .maybeSingle();
+
+      if (claimError) {
+        console.error(`[poll] Failed to claim queued job ${nextJob.id}:`, claimError.message);
+        await new Promise((r) => setTimeout(r, 4000));
+        continue;
+      }
+      if (!job) {
+        console.log(`[poll] Job ${nextJob.id} was already claimed by another worker`);
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+
+      lastClaimedJobAt = new Date().toISOString();
+      jobLogHistory.set(job.id, `[${new Date().toISOString()}] Worker claimed job`);
+      console.log(`[poll] Claimed job ${job.id}, processing...`);
 
       try {
         await processJob(job);
