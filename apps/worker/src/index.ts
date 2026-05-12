@@ -1,8 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
 import { spawn } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, access } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
-import { extname } from "node:path";
+import { extname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import http from "node:http";
@@ -21,6 +22,9 @@ const dbUrl = requireEnv("POSTGRES_OGR_DSN");
 const postgresDsn = requireEnv("POSTGRES_DSN");
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+let lastPollAt: string | null = null;
+let lastClaimedJobAt: string | null = null;
+let lastCompletedJobAt: string | null = null;
 
 async function updateJob(id: number, status: string, logs: string) {
   const { error } = await supabase.from("gis_processing_jobs").update({ status, logs }).eq("id", id);
@@ -30,10 +34,12 @@ async function updateJob(id: number, status: string, logs: string) {
 }
 
 async function claimNextQueuedJob() {
+  lastPollAt = new Date().toISOString();
   const { data: nextJob, error: pollError } = await supabase
     .from("gis_processing_jobs")
     .select("id")
     .eq("status", "queued")
+    .eq("is_active", true)
     .order("created_at", { ascending: true })
     .limit(1)
     .maybeSingle();
@@ -56,6 +62,9 @@ async function claimNextQueuedJob() {
     throw new Error(`Failed to claim queued job ${nextJob.id}: ${claimError.message}`);
   }
 
+  if (claimedJob) {
+    lastClaimedJobAt = new Date().toISOString();
+  }
   return claimedJob;
 }
 
@@ -160,8 +169,137 @@ async function runCommandCapture(name: string, file: string, args: string[], tim
   return stdout.trim();
 }
 
+async function getDbIdentity(dsn: string, label: string) {
+  const raw = await runCommandCapture(`${label} identity`, "psql", [
+    dsn,
+    "-tAc",
+    "select concat_ws('|', current_database(), coalesce(inet_server_addr()::text,'local'), inet_server_port()::text);"
+  ]);
+  return raw;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+async function resolveFinalizeSqlPath() {
+  if (process.env.FINALIZE_SQL_PATH) {
+    console.log(`[job] Using FINALIZE_SQL_PATH override: ${process.env.FINALIZE_SQL_PATH}`);
+    return process.env.FINALIZE_SQL_PATH;
+  }
+
+  const moduleDir = resolve(fileURLToPath(new URL(".", import.meta.url)));
+  const candidatePaths = [
+    "/app/sql/finalize.sql",
+    resolve(moduleDir, "../sql/finalize.sql"),
+    resolve(moduleDir, "../../sql/finalize.sql"),
+    resolve(moduleDir, "../../../sql/finalize.sql"),
+    resolve(process.cwd(), "sql/finalize.sql"),
+    resolve(process.cwd(), "../sql/finalize.sql"),
+    resolve(process.cwd(), "../../sql/finalize.sql")
+  ];
+
+  for (const candidate of candidatePaths) {
+    try {
+      await access(candidate);
+      console.log(`[job] Resolved finalize.sql path: ${candidate}`);
+      return candidate;
+    } catch {
+      // try next candidate
+    }
+  }
+
+  throw new Error(`Could not find finalize.sql. Tried: ${candidatePaths.join(", ")}.`);
+}
+
+async function createSignedDownloadUrl(storagePath: string) {
+  const { data: signedData, error: signedUrlError } = await supabase.storage
+    .from("gis-uploads")
+    .createSignedUrl(storagePath, 60 * 60);
+  if (signedUrlError) throw new Error(`Failed to create signed URL for "${storagePath}": ${signedUrlError.message}`);
+  if (!signedData?.signedUrl) throw new Error(`Failed to create signed URL for source file "${storagePath}"`);
+  return signedData.signedUrl;
+}
+
+async function downloadViaSupabaseAdmin(storagePath: string, localPath: string) {
+  const { data, error } = await supabase.storage.from("gis-uploads").download(storagePath);
+  if (error) {
+    throw new Error(`Supabase admin download failed for "${storagePath}": ${error.message}`);
+  }
+  if (!data) {
+    throw new Error(`Supabase admin download returned no data for "${storagePath}"`);
+  }
+
+  const sourceFile = createWriteStream(localPath, { flags: "w" });
+  await pipeline(Readable.fromWeb(data.stream() as any), sourceFile);
+}
+
+async function downloadToFileWithRetry(
+  getSignedUrl: () => Promise<string>,
+  localPath: string,
+  attempts = 3
+) {
+  let lastError: unknown = null;
+  const timeoutMs = 10 * 60 * 1000;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let timeout: NodeJS.Timeout | null = null;
+    try {
+      const signedUrl = await getSignedUrl();
+      const controller = new AbortController();
+      timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+      const downloadResponse = await fetch(signedUrl, { signal: controller.signal });
+      if (!downloadResponse.ok) {
+        throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
+      }
+      if (!downloadResponse.body) {
+        throw new Error("Storage download failed: missing response stream");
+      }
+
+      const sourceFile = createWriteStream(localPath, { flags: "w" });
+      await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
+      console.log(`[job] Download succeeded on attempt ${attempt}/${attempts}`);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      const backoffMs = attempt * 1000;
+      console.warn(`Download attempt ${attempt}/${attempts} failed, retrying in ${backoffMs}ms...`);
+      await sleep(backoffMs);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  throw new Error(
+    `Storage download failed after ${attempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`
+  );
+}
+
 async function processJob(job: any) {
   await updateJob(job.id, "processing", "Downloading upload from storage");
+  console.log(`[job ${job.id}] starting with storage_path="${job.storage_path}" filename="${job.original_filename}"`);
+
+  const postgresJobExistsRaw = await runCommandCapture("postgres job existence check", "psql", [
+    postgresDsn,
+    "-tAc",
+    `select count(*) from public.gis_processing_jobs where id = ${Number(job.id)};`
+  ]);
+  const postgresJobExists = Number.parseInt(postgresJobExistsRaw, 10);
+  if (!Number.isFinite(postgresJobExists) || postgresJobExists <= 0) {
+    throw new Error(
+      `Job ${job.id} exists in Supabase queue but not in POSTGRES_DSN database. Check DB env alignment between Supabase and worker Postgres DSNs.`
+    );
+  }
+
+  const ogrIdentity = await getDbIdentity(dbUrl, "POSTGRES_OGR_DSN");
+  const psqlIdentity = await getDbIdentity(postgresDsn, "POSTGRES_DSN");
+  if (ogrIdentity !== psqlIdentity) {
+    throw new Error(
+      `POSTGRES_OGR_DSN and POSTGRES_DSN target different databases (ogr=${ogrIdentity}, psql=${psqlIdentity}).`
+    );
+  }
 
   await mkdir("/tmp/gml", { recursive: true });
   const sourceExt = extname(job.original_filename ?? "").toLowerCase();
@@ -169,23 +307,14 @@ async function processJob(job: any) {
   const localPath = `/tmp/gml/${job.id}${localExt}`;
 
   try {
-    const { data: signedData, error: signedUrlError } = await supabase.storage
-      .from("gis-uploads")
-      .createSignedUrl(job.storage_path, 60 * 15);
-    if (signedUrlError) throw new Error(`Failed to create signed URL: ${signedUrlError.message}`);
-    if (!signedData?.signedUrl) throw new Error("Failed to create signed URL for source file");
-
-    const downloadResponse = await fetch(signedData.signedUrl);
-    if (!downloadResponse.ok) {
-      throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
-    }
-    if (!downloadResponse.body) {
-      throw new Error("Storage download failed: missing response stream");
-    }
-
     await updateJob(job.id, "processing", "Downloading source file to worker disk");
-    const sourceFile = createWriteStream(localPath, { flags: "w" });
-    await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
+    try {
+      await downloadViaSupabaseAdmin(job.storage_path, localPath);
+      console.log(`[job ${job.id}] Downloaded via Supabase admin storage API`);
+    } catch (adminDownloadError) {
+      console.warn(`[job ${job.id}] Admin storage download failed, falling back to signed URL:`, adminDownloadError);
+      await downloadToFileWithRetry(() => createSignedDownloadUrl(job.storage_path), localPath, 3);
+    }
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
     await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
@@ -250,7 +379,9 @@ async function processJob(job: any) {
     }
 
     await updateJob(job.id, "processing", "Running finalize.sql");
-    await runCommand("psql finalize", "psql", [postgresDsn, "-f", "/app/sql/finalize.sql"]);
+    const finalizeSqlPath = await resolveFinalizeSqlPath();
+    await updateJob(job.id, "processing", `Running finalize.sql at: ${finalizeSqlPath}`);
+    await runCommand("psql finalize", "psql", [postgresDsn, "-f", finalizeSqlPath]);
 
     const parcelCountRaw = await runCommandCapture("parcel table count", "psql", [
       postgresDsn,
@@ -269,17 +400,21 @@ async function processJob(job: any) {
 }
 
 async function run() {
+  console.log("[worker] polling loop started");
   while (true) {
     try {
       const job = await claimNextQueuedJob();
 
       if (!job) {
+        console.log(`[worker] no queued jobs (last poll ${lastPollAt})`);
         await new Promise((r) => setTimeout(r, 4000));
         continue;
       }
+      console.log(`[worker] claimed job ${job.id}`);
 
       try {
         await processJob(job);
+        lastCompletedJobAt = new Date().toISOString();
       } catch (e: any) {
         console.error(`Job ${job.id} failed:`, e?.message ?? e);
         await updateJob(job.id, "failed", e?.message ?? "Unknown worker error");
@@ -294,8 +429,15 @@ async function run() {
 // Start HTTP health server for Railway
 const server = http.createServer((req, res) => {
   if (req.url === "/health" || req.url === "/") {
-    res.writeHead(200);
-    res.end("ok");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        lastPollAt,
+        lastClaimedJobAt,
+        lastCompletedJobAt
+      })
+    );
     return;
   }
 
