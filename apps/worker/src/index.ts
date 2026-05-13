@@ -7,6 +7,11 @@ import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import http from "node:http";
+import { writeSync } from "node:fs";
+
+function logLine(message: string) {
+  writeSync(1, `${message}\n`);
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -22,6 +27,12 @@ const dbUrl = requireEnv("POSTGRES_OGR_DSN");
 const postgresDsn = requireEnv("POSTGRES_DSN");
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+logLine("=== WORKER STARTED ===");
+logLine(`SUPABASE_URL: ${supabaseUrl ? "present" : "MISSING"}`);
+logLine(`POSTGRES_OGR_DSN: ${dbUrl ? "present" : "MISSING"}`);
+logLine(`POSTGRES_DSN: ${postgresDsn ? "present" : "MISSING"}`);
+logMemory("startup");
+
 let lastPollAt: string | null = null;
 let lastClaimedJobAt: string | null = null;
 let lastCompletedJobAt: string | null = null;
@@ -176,9 +187,17 @@ async function runCommandCapture(name: string, file: string, args: string[], tim
   return stdout.trim();
 }
 
+function normalizePsqlDsn(dsn: string) {
+  // ogr2ogr often uses "PG:host=... dbname=..." syntax, which psql rejects.
+  if (dsn.startsWith("PG:")) {
+    return dsn.slice(3).trim();
+  }
+  return dsn;
+}
+
 async function getDbIdentity(dsn: string, label: string) {
   const raw = await runCommandCapture(`${label} identity`, "psql", [
-    dsn,
+    normalizePsqlDsn(dsn),
     "-tAc",
     "select concat_ws('|', current_database(), coalesce(inet_server_addr()::text,'local'), inet_server_port()::text);"
   ]);
@@ -219,73 +238,45 @@ async function resolveFinalizeSqlPath() {
   throw new Error(`Could not find finalize.sql. Tried: ${candidatePaths.join(", ")}.`);
 }
 
-async function createSignedDownloadUrl(storagePath: string) {
-  const { data: signedData, error: signedUrlError } = await supabase.storage
+async function downloadToFile(storagePath: string, localPath: string) {
+  console.log(`[job] Downloading ${storagePath} to ${localPath}`);
+
+  // Primary: Admin client download (service_role bypasses everything)
+  try {
+    const { data, error } = await supabase.storage.from("gis-uploads").download(storagePath);
+
+    if (error) throw error;
+    if (!data) throw new Error("No data returned from download");
+
+    const sourceFile = createWriteStream(localPath);
+    await pipeline(Readable.fromWeb(data.stream() as any), sourceFile);
+    console.log("[job] Download succeeded via admin client");
+    return;
+  } catch (adminErr: any) {
+    console.warn("[job] Admin download failed:", adminErr.message);
+  }
+
+  // Fallback: Signed URL
+  console.log("[job] Falling back to signed URL...");
+  const { data: signedData, error: signedErr } = await supabase.storage
     .from("gis-uploads")
-    .createSignedUrl(storagePath, 60 * 60);
-  if (signedUrlError) throw new Error(`Failed to create signed URL for "${storagePath}": ${signedUrlError.message}`);
-  if (!signedData?.signedUrl) throw new Error(`Failed to create signed URL for source file "${storagePath}"`);
-  return signedData.signedUrl;
-}
+    .createSignedUrl(storagePath, 3600);
 
-async function downloadViaSupabaseAdmin(storagePath: string, localPath: string) {
-  const { data, error } = await supabase.storage.from("gis-uploads").download(storagePath);
-  if (error) {
-    throw new Error(`Supabase admin download failed for "${storagePath}": ${error.message}`);
-  }
-  if (!data) {
-    throw new Error(`Supabase admin download returned no data for "${storagePath}"`);
+  if (signedErr || !signedData?.signedUrl) {
+    throw new Error(`Signed URL failed: ${signedErr?.message}`);
   }
 
-  const sourceFile = createWriteStream(localPath, { flags: "w" });
-  await pipeline(Readable.fromWeb(data.stream() as any), sourceFile);
-}
+  const res = await fetch(signedData.signedUrl);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.body) throw new Error("Missing response stream body");
 
-async function downloadToFileWithRetry(
-  getSignedUrl: () => Promise<string>,
-  localPath: string,
-  attempts = 3
-) {
-  let lastError: unknown = null;
-  const timeoutMs = 10 * 60 * 1000;
-
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    let timeout: NodeJS.Timeout | null = null;
-    try {
-      const signedUrl = await getSignedUrl();
-      const controller = new AbortController();
-      timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-      const downloadResponse = await fetch(signedUrl, { signal: controller.signal });
-      if (!downloadResponse.ok) {
-        throw new Error(`Storage download failed: HTTP ${downloadResponse.status}`);
-      }
-      if (!downloadResponse.body) {
-        throw new Error("Storage download failed: missing response stream");
-      }
-
-      const sourceFile = createWriteStream(localPath, { flags: "w" });
-      await pipeline(Readable.fromWeb(downloadResponse.body as any), sourceFile);
-      console.log(`[job] Download succeeded on attempt ${attempt}/${attempts}`);
-      return;
-    } catch (error) {
-      lastError = error;
-      if (attempt >= attempts) break;
-      const backoffMs = attempt * 1000;
-      console.warn(`Download attempt ${attempt}/${attempts} failed, retrying in ${backoffMs}ms...`);
-      await sleep(backoffMs);
-    } finally {
-      if (timeout) clearTimeout(timeout);
-    }
-  }
-
-  throw new Error(
-    `Storage download failed after ${attempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`
-  );
+  const sourceFile = createWriteStream(localPath);
+  await pipeline(Readable.fromWeb(res.body as any), sourceFile);
+  console.log("[job] Download succeeded via signed URL");
 }
 
 async function processJob(job: any) {
-  await updateJob(job.id, "processing", "Downloading upload from storage");
+  await updateJob(job.id, "processing", "Downloading source file from storage");
   console.log(`[job ${job.id}] starting with storage_path="${job.storage_path}" filename="${job.original_filename}"`);
 
   const postgresJobExistsRaw = await runCommandCapture("postgres job existence check", "psql", [
@@ -314,14 +305,8 @@ async function processJob(job: any) {
   const localPath = `/tmp/gml/${job.id}${localExt}`;
 
   try {
-    await updateJob(job.id, "processing", "Downloading source file to worker disk");
-    try {
-      await downloadViaSupabaseAdmin(job.storage_path, localPath);
-      console.log(`[job ${job.id}] Downloaded via Supabase admin storage API`);
-    } catch (adminDownloadError) {
-      console.warn(`[job ${job.id}] Admin storage download failed, falling back to signed URL:`, adminDownloadError);
-      await downloadToFileWithRetry(() => createSignedDownloadUrl(job.storage_path), localPath, 3);
-    }
+    await updateJob(job.id, "processing", "Downloading source file from storage");
+    await downloadToFile(job.storage_path, localPath);
 
     await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
     await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
@@ -406,8 +391,51 @@ async function processJob(job: any) {
   }
 }
 
+async function recoverStuckProcessingJobs(staleMinutes = 20) {
+  const staleBeforeIso = new Date(Date.now() - staleMinutes * 60 * 1000).toISOString();
+  const { data: stuckJobs, error: selectError } = await supabase
+    .from("gis_processing_jobs")
+    .select("id,status,updated_at")
+    .eq("status", "processing")
+    .eq("is_active", true)
+    .lt("updated_at", staleBeforeIso);
+
+  if (selectError) {
+    console.error("[startup] Failed to query stuck jobs:", selectError.message);
+    return;
+  }
+
+  if (!stuckJobs?.length) {
+    console.log("[startup] No stale processing jobs to recover");
+    return;
+  }
+
+  console.warn(
+    `[startup] Recovering ${stuckJobs.length} stale processing job(s) older than ${staleMinutes} minute(s): ${stuckJobs
+      .map((j) => j.id)
+      .join(", ")}`
+  );
+
+  for (const stuckJob of stuckJobs) {
+    const { error: resetError } = await supabase
+      .from("gis_processing_jobs")
+      .update({
+        status: "queued",
+        logs: `Worker recovered stale processing job at ${new Date().toISOString()}`
+      })
+      .eq("id", stuckJob.id)
+      .eq("status", "processing");
+    if (resetError) {
+      console.error(`[startup] Failed to requeue stuck job ${stuckJob.id}:`, resetError.message);
+    } else {
+      console.log(`[startup] Requeued stuck job ${stuckJob.id}`);
+    }
+  }
+}
+
 async function run() {
-  console.log("[worker] polling loop started");
+  logLine("[worker] polling loop started");
+  await recoverStuckProcessingJobs();
   while (true) {
     try {
       console.log("[poll] Checking for queued jobs...");
@@ -494,8 +522,14 @@ const server = http.createServer((req, res) => {
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
-  console.log(`Health check listening on port ${port}`);
+  logLine(`Health check listening on port ${port}`);
 });
+
+setInterval(() => {
+  logLine(
+    `[heartbeat] alive lastPollAt=${lastPollAt ?? "never"} lastClaimedJobAt=${lastClaimedJobAt ?? "never"} lastCompletedJobAt=${lastCompletedJobAt ?? "never"}`
+  );
+}, 30_000).unref();
 
 // Start the polling loop
 run().catch((e) => {
