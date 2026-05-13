@@ -28,7 +28,7 @@ export function MapView() {
       map.addSource("parcels", {
         type: "vector",
         tiles: [`${tileBaseUrl}/api/tiles/parcels/{z}/{x}/{y}`],
-        minzoom: 10,
+        minzoom: 8,
         maxzoom: 16
       });
 
@@ -37,7 +37,7 @@ export function MapView() {
         type: "fill",
         source: "parcels",
         "source-layer": "parcels",
-        minzoom: 11,
+        minzoom: 8,
         paint: { "fill-color": "#22c55e", "fill-opacity": 0.15 }
       });
       map.addLayer({
@@ -45,7 +45,7 @@ export function MapView() {
         type: "line",
         source: "parcels",
         "source-layer": "parcels",
-        minzoom: 11,
+        minzoom: 8,
         paint: { "line-color": "#16a34a", "line-width": 1.2 }
       });
       map.addLayer({
@@ -53,7 +53,7 @@ export function MapView() {
         type: "fill",
         source: "parcels",
         "source-layer": "parcels",
-        minzoom: 11,
+        minzoom: 8,
         filter: ["==", ["get", "id"], ""],
         paint: { "fill-color": "#f59e0b", "fill-opacity": 0.35 }
       });
@@ -62,7 +62,7 @@ export function MapView() {
         type: "line",
         source: "parcels",
         "source-layer": "parcels",
-        minzoom: 11,
+        minzoom: 8,
         filter: ["==", ["get", "id"], ""],
         paint: { "line-color": "#b45309", "line-width": 2.5 }
       });
