@@ -38,7 +38,10 @@ const normalizedConnectionString = parsedDsn?.toString() ?? connectionString;
 
 const pool = new Pool({
   connectionString: normalizedConnectionString,
-  ssl: shouldDisableSsl ? false : { rejectUnauthorized: false }
+  ssl: shouldDisableSsl ? false : { rejectUnauthorized: false },
+  max: 1,
+  idleTimeoutMillis: 5000,
+  connectionTimeoutMillis: 5000
 });
 
 pool.on("error", (error: Error) => {
@@ -79,16 +82,18 @@ export async function GET(_: Request, { params }: { params: Promise<{ z: string;
 
     const sql = `
 with bounds as (
-  select ST_TileEnvelope($1, $2, $3) as geom_3857
+  select
+    ST_TileEnvelope($1, $2, $3) as geom_3857,
+    ST_Transform(ST_TileEnvelope($1, $2, $3), 4326) as geom_4326
 ),
 raw as (
   select
-    id,
-    inspire_id,
-    area_acres,
-    area_hectares,
+    p.id,
+    p.inspire_id,
+    p.area_acres,
+    p.area_hectares,
     ST_AsMVTGeom(
-      ST_Transform(p.geom, 3857),
+      ST_Transform(poly.geom, 3857),
       bounds.geom_3857,
       4096,
       64,
@@ -96,7 +101,13 @@ raw as (
     ) as geom
   from public.parcels p
   cross join bounds
-  where ST_Intersects(ST_Transform(p.geom, 3857), bounds.geom_3857)
+  cross join lateral (
+    select ST_CollectionExtract(ST_MakeValid(p.geom), 3) as geom
+  ) poly
+  where p.geom is not null
+    and p.geom && bounds.geom_4326
+    and ST_Intersects(p.geom, bounds.geom_4326)
+    and not ST_IsEmpty(poly.geom)
 )
 select ST_AsMVT(raw, 'parcels', 4096, 'geom') as mvt from raw;`;
 
