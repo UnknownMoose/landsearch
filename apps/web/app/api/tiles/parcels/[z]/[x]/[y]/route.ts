@@ -82,7 +82,9 @@ export async function GET(_: Request, { params }: { params: Promise<{ z: string;
 
     const sql = `
 with bounds as (
-  select ST_TileEnvelope($1, $2, $3) as geom_3857
+  select
+    ST_TileEnvelope($1, $2, $3) as geom_3857,
+    ST_Transform(ST_TileEnvelope($1, $2, $3), 4326) as geom_4326
 ),
 raw as (
   select
@@ -99,7 +101,8 @@ raw as (
     ) as geom
   from public.parcels p
   cross join bounds
-  where ST_Intersects(ST_Transform(p.geom, 3857), bounds.geom_3857)
+  where p.geom && bounds.geom_4326
+    and ST_Intersects(p.geom, bounds.geom_4326)
 )
 select ST_AsMVT(raw, 'parcels', 4096, 'geom') as mvt from raw;`;
 
