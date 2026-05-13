@@ -9,12 +9,29 @@ if (!dsn) {
 }
 
 const connectionString = dsn ?? "postgresql://invalid";
-const sslModeMatch = connectionString.match(/sslmode=([^&]+)/i);
-const sslMode = sslModeMatch?.[1]?.toLowerCase();
+const parsedDsn = (() => {
+  try {
+    return new URL(connectionString);
+  } catch {
+    return null;
+  }
+})();
+
+const sslMode = parsedDsn?.searchParams.get("sslmode")?.toLowerCase();
 const shouldDisableSsl = sslMode === "disable";
 
+if (parsedDsn) {
+  // Force node-postgres to use runtime SSL settings instead of file-based cert validation
+  // options that can break in managed/serverless environments.
+  parsedDsn.searchParams.delete("sslcert");
+  parsedDsn.searchParams.delete("sslkey");
+  parsedDsn.searchParams.delete("sslrootcert");
+}
+
+const normalizedConnectionString = parsedDsn?.toString() ?? connectionString;
+
 const pool = new Pool({
-  connectionString,
+  connectionString: normalizedConnectionString,
   ssl: shouldDisableSsl ? false : { rejectUnauthorized: false }
 });
 
