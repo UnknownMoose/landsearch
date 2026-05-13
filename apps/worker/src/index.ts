@@ -189,10 +189,18 @@ async function runCommandCapture(name: string, file: string, args: string[], tim
 
 function normalizePsqlDsn(dsn: string) {
   // ogr2ogr often uses "PG:host=... dbname=..." syntax, which psql rejects.
-  if (dsn.startsWith("PG:")) {
-    return dsn.slice(3).trim();
+  // Some environments also wrap DSNs in quotes.
+  const trimmed = dsn.trim();
+  const unquoted =
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))
+      ? trimmed.slice(1, -1).trim()
+      : trimmed;
+
+  if (/^PG:/i.test(unquoted)) {
+    return unquoted.replace(/^PG:/i, "").trim();
   }
-  return dsn;
+
+  return unquoted;
 }
 
 async function getDbIdentity(dsn: string, label: string) {
