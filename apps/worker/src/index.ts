@@ -263,7 +263,7 @@ async function downloadToFile(storagePath: string, localPath: string) {
 }
 
 async function processJob(job: any) {
-  await updateJob(job.id, "processing", "Downloading upload from storage");
+  await updateJob(job.id, "processing", "Downloading source file from storage");
   console.log(`[job ${job.id}] starting with storage_path="${job.storage_path}" filename="${job.original_filename}"`);
 
   const postgresJobExistsRaw = await runCommandCapture("postgres job existence check", "psql", [
@@ -378,8 +378,51 @@ async function processJob(job: any) {
   }
 }
 
+async function recoverStuckProcessingJobs(staleMinutes = 20) {
+  const staleBeforeIso = new Date(Date.now() - staleMinutes * 60 * 1000).toISOString();
+  const { data: stuckJobs, error: selectError } = await supabase
+    .from("gis_processing_jobs")
+    .select("id,status,updated_at")
+    .eq("status", "processing")
+    .eq("is_active", true)
+    .lt("updated_at", staleBeforeIso);
+
+  if (selectError) {
+    console.error("[startup] Failed to query stuck jobs:", selectError.message);
+    return;
+  }
+
+  if (!stuckJobs?.length) {
+    console.log("[startup] No stale processing jobs to recover");
+    return;
+  }
+
+  console.warn(
+    `[startup] Recovering ${stuckJobs.length} stale processing job(s) older than ${staleMinutes} minute(s): ${stuckJobs
+      .map((j) => j.id)
+      .join(", ")}`
+  );
+
+  for (const stuckJob of stuckJobs) {
+    const { error: resetError } = await supabase
+      .from("gis_processing_jobs")
+      .update({
+        status: "queued",
+        logs: `Worker recovered stale processing job at ${new Date().toISOString()}`
+      })
+      .eq("id", stuckJob.id)
+      .eq("status", "processing");
+    if (resetError) {
+      console.error(`[startup] Failed to requeue stuck job ${stuckJob.id}:`, resetError.message);
+    } else {
+      console.log(`[startup] Requeued stuck job ${stuckJob.id}`);
+    }
+  }
+}
+
 async function run() {
   console.log("[worker] polling loop started");
+  await recoverStuckProcessingJobs();
   while (true) {
     try {
       console.log("[poll] Checking for queued jobs...");
