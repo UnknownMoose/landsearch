@@ -7,6 +7,11 @@ import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import http from "node:http";
+import { writeSync } from "node:fs";
+
+function logLine(message: string) {
+  writeSync(1, `${message}\n`);
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -22,10 +27,10 @@ const dbUrl = requireEnv("POSTGRES_OGR_DSN");
 const postgresDsn = requireEnv("POSTGRES_DSN");
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
-console.log("=== WORKER STARTED ===");
-console.log("SUPABASE_URL:", supabaseUrl ? "present" : "MISSING");
-console.log("POSTGRES_OGR_DSN:", dbUrl ? "present" : "MISSING");
-console.log("POSTGRES_DSN:", postgresDsn ? "present" : "MISSING");
+logLine("=== WORKER STARTED ===");
+logLine(`SUPABASE_URL: ${supabaseUrl ? "present" : "MISSING"}`);
+logLine(`POSTGRES_OGR_DSN: ${dbUrl ? "present" : "MISSING"}`);
+logLine(`POSTGRES_DSN: ${postgresDsn ? "present" : "MISSING"}`);
 logMemory("startup");
 
 let lastPollAt: string | null = null;
@@ -421,7 +426,7 @@ async function recoverStuckProcessingJobs(staleMinutes = 20) {
 }
 
 async function run() {
-  console.log("[worker] polling loop started");
+  logLine("[worker] polling loop started");
   await recoverStuckProcessingJobs();
   while (true) {
     try {
@@ -509,8 +514,14 @@ const server = http.createServer((req, res) => {
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
-  console.log(`Health check listening on port ${port}`);
+  logLine(`Health check listening on port ${port}`);
 });
+
+setInterval(() => {
+  logLine(
+    `[heartbeat] alive lastPollAt=${lastPollAt ?? "never"} lastClaimedJobAt=${lastClaimedJobAt ?? "never"} lastCompletedJobAt=${lastCompletedJobAt ?? "never"}`
+  );
+}, 30_000).unref();
 
 // Start the polling loop
 run().catch((e) => {
