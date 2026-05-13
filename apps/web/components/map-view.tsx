@@ -17,7 +17,20 @@ export function MapView() {
     if (!ref.current) return;
     const map = new maplibregl.Map({
       container: ref.current,
-      style: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+      style: {
+        version: 8,
+        sources: {
+          satellite: {
+            type: "raster",
+            tiles: [
+              "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+            ],
+            tileSize: 256,
+            attribution: "© Esri"
+          }
+        },
+        layers: [{ id: "satellite", type: "raster", source: "satellite" }]
+      },
       center: [-2.2, 55.2],
       zoom: 8
     });
@@ -38,7 +51,7 @@ export function MapView() {
         source: "parcels",
         "source-layer": "parcels",
         minzoom: 8,
-        paint: { "fill-color": "#22c55e", "fill-opacity": 0.15 }
+        paint: { "fill-color": "#22c55e", "fill-opacity": 0 }
       });
       map.addLayer({
         id: "parcels-line",
@@ -46,7 +59,7 @@ export function MapView() {
         source: "parcels",
         "source-layer": "parcels",
         minzoom: 8,
-        paint: { "line-color": "#16a34a", "line-width": 1.2 }
+        paint: { "line-color": "#10b981", "line-width": 2 }
       });
       map.addLayer({
         id: "parcels-selected-fill",
@@ -55,7 +68,7 @@ export function MapView() {
         "source-layer": "parcels",
         minzoom: 8,
         filter: ["==", ["get", "id"], ""],
-        paint: { "fill-color": "#f59e0b", "fill-opacity": 0.35 }
+        paint: { "fill-color": "#7c3aed", "fill-opacity": 0.35 }
       });
       map.addLayer({
         id: "parcels-selected-line",
@@ -64,7 +77,7 @@ export function MapView() {
         "source-layer": "parcels",
         minzoom: 8,
         filter: ["==", ["get", "id"], ""],
-        paint: { "line-color": "#b45309", "line-width": 2.5 }
+        paint: { "line-color": "#6d28d9", "line-width": 2.8 }
       });
 
       map.on("click", "parcels-fill", (e) => {
@@ -76,7 +89,7 @@ export function MapView() {
           map.setFilter("parcels-selected-fill", ["==", ["get", "id"], selectedParcelId]);
           map.setFilter("parcels-selected-line", ["==", ["get", "id"], selectedParcelId]);
         }
-        new maplibregl.Popup().setLngLat(e.lngLat).setHTML(`<strong>INSPIRE:</strong> ${p.inspire_id || "n/a"}<br/><strong>Acres:</strong> ${Number(p.area_acres || 0).toFixed(2)}<br/><strong>Hectares:</strong> ${Number(p.area_hectares || 0).toFixed(2)}<br/><strong>Title ref:</strong> placeholder`).addTo(map);
+        new maplibregl.Popup().setLngLat(e.lngLat).setHTML(`<div class="parcel-popup"><strong>INSPIRE:</strong> ${p.inspire_id || "n/a"}<br/><strong>Acres:</strong> ${Number(p.area_acres || 0).toFixed(2)}<br/><strong>Hectares:</strong> ${Number(p.area_hectares || 0).toFixed(2)}<br/><strong>Title ref:</strong> placeholder</div>`).addTo(map);
       });
     });
 
