@@ -9,11 +9,13 @@ if (!dsn) {
 }
 
 const connectionString = dsn ?? "postgresql://invalid";
-const shouldUseSslFallback = !/sslmode=/i.test(connectionString);
+const sslModeMatch = connectionString.match(/sslmode=([^&]+)/i);
+const sslMode = sslModeMatch?.[1]?.toLowerCase();
+const shouldDisableSsl = sslMode === "disable";
 
 const pool = new Pool({
   connectionString,
-  ssl: shouldUseSslFallback ? { rejectUnauthorized: false } : undefined
+  ssl: shouldDisableSsl ? false : { rejectUnauthorized: false }
 });
 
 pool.on("error", (error: Error) => {
@@ -89,10 +91,11 @@ select ST_AsMVT(raw, 'parcels', 4096, 'geom') as mvt from raw;`;
       }
     });
   } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error";
     console.error("[tiles/parcels] Unhandled route error", error);
 
     return Response.json(
-      { error: "Tile generation failed." },
+      { error: "Tile generation failed.", details: message },
       { status: 500 }
     );
   }
