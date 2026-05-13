@@ -316,8 +316,20 @@ async function processJob(job: any) {
     await updateJob(job.id, "processing", "Downloading source file from storage");
     await downloadToFile(job.storage_path, localPath);
 
-    await updateJob(job.id, "processing", "Downloaded upload, importing with ogr2ogr");
-    await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 5 * 60 * 1000);
+    await updateJob(job.id, "processing", "Downloaded upload, running preflight checks");
+    try {
+      await runCommand("ogrinfo preflight", "ogrinfo", ["-ro", "-so", localPath], 60 * 1000);
+    } catch (preflightError: any) {
+      const message = preflightError?.message ?? String(preflightError);
+      console.warn(`[job ${job.id}] ogrinfo preflight failed or timed out; continuing to ogr2ogr: ${message}`);
+      await updateJob(
+        job.id,
+        "processing",
+        `Preflight warning (${message}). Continuing with ogr2ogr import.`
+      );
+    }
+
+    await updateJob(job.id, "processing", "Importing source with ogr2ogr");
 
     await runCommand(
       "ogr2ogr",
