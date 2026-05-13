@@ -101,7 +101,9 @@ raw as (
     ) as geom
   from public.parcels p
   cross join bounds
-  where p.geom && bounds.geom_4326
+  where p.geom is not null
+    and ST_IsValid(p.geom)
+    and p.geom && bounds.geom_4326
     and ST_Intersects(p.geom, bounds.geom_4326)
 )
 select ST_AsMVT(raw, 'parcels', 4096, 'geom') as mvt from raw;`;
