@@ -26,6 +26,12 @@ if (parsedDsn) {
   parsedDsn.searchParams.delete("sslcert");
   parsedDsn.searchParams.delete("sslkey");
   parsedDsn.searchParams.delete("sslrootcert");
+
+  // Avoid query-string SSL settings from overriding the explicit `ssl` pool option.
+  if (sslMode && sslMode !== "disable") {
+    parsedDsn.searchParams.delete("sslmode");
+  }
+  parsedDsn.searchParams.delete("ssl");
 }
 
 const normalizedConnectionString = parsedDsn?.toString() ?? connectionString;
