@@ -38,7 +38,10 @@ const normalizedConnectionString = parsedDsn?.toString() ?? connectionString;
 
 const pool = new Pool({
   connectionString: normalizedConnectionString,
-  ssl: shouldDisableSsl ? false : { rejectUnauthorized: false }
+  ssl: shouldDisableSsl ? false : { rejectUnauthorized: false },
+  max: 1,
+  idleTimeoutMillis: 5000,
+  connectionTimeoutMillis: 5000
 });
 
 pool.on("error", (error: Error) => {
