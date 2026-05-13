@@ -16,7 +16,7 @@ const pool = new Pool({
   ssl: shouldUseSslFallback ? { rejectUnauthorized: false } : undefined
 });
 
-pool.on("error", (error) => {
+pool.on("error", (error: Error) => {
   console.error("[tiles/parcels] PostgreSQL pool error", error);
 });
 
@@ -88,7 +88,7 @@ select ST_AsMVT(raw, 'parcels', 4096, 'geom') as mvt from raw;`;
         "Cache-Control": "public, max-age=120, s-maxage=600, stale-while-revalidate=86400"
       }
     });
-  } catch (error) {
+  } catch (error: unknown) {
     console.error("[tiles/parcels] Unhandled route error", error);
 
     return Response.json(
