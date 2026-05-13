@@ -187,9 +187,17 @@ async function runCommandCapture(name: string, file: string, args: string[], tim
   return stdout.trim();
 }
 
+function normalizePsqlDsn(dsn: string) {
+  // ogr2ogr often uses "PG:host=... dbname=..." syntax, which psql rejects.
+  if (dsn.startsWith("PG:")) {
+    return dsn.slice(3).trim();
+  }
+  return dsn;
+}
+
 async function getDbIdentity(dsn: string, label: string) {
   const raw = await runCommandCapture(`${label} identity`, "psql", [
-    dsn,
+    normalizePsqlDsn(dsn),
     "-tAc",
     "select concat_ws('|', current_database(), coalesce(inet_server_addr()::text,'local'), inet_server_port()::text);"
   ]);
